@@ -9,21 +9,18 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Header, Input, Static, TabbedContent, TabPane
+from textual.widgets import DataTable, Header, Input, TabbedContent, TabPane
 
-from .models import Track, format_duration
+from .models import Track
 from .mpv_client import MpvClient, MpvError
 from .queue import QueueModel
+from .widgets import HelpScreen, PlayerBar, hints_for
 from .ytm import YTMusicClient
 
 SEARCH_DEBOUNCE = 0.4
 SEEK_STEP = 5.0
 VOLUME_STEP = 5
-PROGRESS_WIDTH = 24
-HINTS = (
-    "/ search · q queue · tab focus · enter play · space pause · n/p next/prev · "
-    "←/→ seek · +/- volume · a add · d remove · esc back · ctrl+q quit"
-)
+G_PREFIX_TIMEOUT = 1.0
 
 
 class TrackTable(DataTable, inherit_bindings=False):
@@ -42,58 +39,9 @@ class TrackTable(DataTable, inherit_bindings=False):
     ]
 
 
-def _progress_bar(position: float | None, duration: float | None) -> str:
-    if not duration or duration <= 0 or position is None:
-        return "░" * PROGRESS_WIDTH
-    frac = min(1.0, max(0.0, position / duration))
-    filled = round(frac * PROGRESS_WIDTH)
-    return "█" * filled + "░" * (PROGRESS_WIDTH - filled)
-
-
-class PlayerBar(Static):
-    """Persistent bottom bar: now playing, progress, volume, hints."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.track: Track | None = None
-        self.position: float | None = None
-        self.duration: float | None = None
-        self.playing = False
-        self.paused = False
-        self.volume = 100
-        self.queue_index = 0
-        self.queue_length = 0
-        self.update(self._render_state())
-
-    def sync(self, **state: Any) -> None:
-        for name, value in state.items():
-            setattr(self, name, value)
-        self.update(self._render_state())
-
-    def _render_state(self) -> Text:
-        out = Text()
-        if self.track is None:
-            out.append("■  Nothing playing", style="bold dim")
-            out.append("  —  search something and press Enter")
-        else:
-            icon = "⏸" if self.paused else "▶"
-            if not self.playing:
-                icon = "■"
-            out.append(f" {icon} ", style="bold green" if icon == "▶" else "yellow")
-            out.append(self.track.title, style="bold")
-            out.append(f" — {self.track.artist_str}   ", style="cyan")
-            out.append(
-                f"{format_duration(int(self.position or 0))}"
-                f"/{format_duration(int(self.duration) if self.duration else None)} ",
-                style="dim",
-            )
-            out.append(_progress_bar(self.position, self.duration), style="green")
-            out.append(f"  vol {self.volume}%  ", style="magenta")
-            if self.queue_length:
-                out.append(f"[{self.queue_index}/{self.queue_length}]", style="yellow")
-        out.append("\n")
-        out.append(HINTS, style="dim")
-        return out
+def _placeholder(table: TrackTable, message: str) -> None:
+    """Add a dimmed single-cell status/placeholder row."""
+    table.add_row("", Text(message, style="dim"), "", "")
 
 
 class YTMusicTUI(App):
@@ -128,21 +76,45 @@ class YTMusicTUI(App):
         background: $panel;
         padding: 0 1;
     }
+    #help-box {
+        width: 74;
+        max-width: 94%;
+        height: auto;
+        max-height: 85%;
+        border: tall $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #help-content {
+        width: 100%;
+    }
     """
 
     BINDINGS = [
         Binding("/", "focus_search", "Search", show=False),
+        Binding("r", "show_results", "Results", show=False),
         Binding("q", "show_queue", "Queue", show=False),
         Binding("space", "toggle_pause", "Play/Pause", show=False),
         Binding("n", "next_track", "Next", show=False),
         Binding("p", "prev_track", "Prev", show=False),
         Binding("left", "seek_backward", "Seek -5s", show=False),
         Binding("right", "seek_forward", "Seek +5s", show=False),
+        Binding("h", "seek_backward", show=False),
+        Binding("l", "seek_forward", show=False),
+        Binding("j", "cursor_down", show=False),
+        Binding("k", "cursor_up", show=False),
+        Binding("g", "g_prefix", show=False),
+        Binding("G", "scroll_last", show=False),
+        Binding("ctrl+d", "half_page_down", show=False),
+        Binding("ctrl+u", "half_page_up", show=False),
+        Binding("ctrl+f", "page_down", show=False),
+        Binding("ctrl+b", "page_up", show=False),
         Binding("+", "volume_up", "Volume +", show=False),
         Binding("=", "volume_up", show=False),
         Binding("-", "volume_down", "Volume -", show=False),
         Binding("a", "enqueue", "Add to queue", show=False),
         Binding("d", "remove", "Remove", show=False),
+        Binding("t", "cycle_theme", "Theme", show=False),
         Binding("escape", "go_back", "Back", show=False),
         Binding("?", "show_help", "Help", show=False),
     ]
@@ -164,6 +136,8 @@ class YTMusicTUI(App):
         self.duration: float | None = None
         self.volume = 100
         self._error_retries = 0
+        self._g_pending = False
+        self._g_timer: Any = None
 
     # -- composition --------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -190,13 +164,19 @@ class YTMusicTUI(App):
         results.add_column("Artist", width=38)
         results.add_column("Album", width=22)
         results.add_column("Dur", width=6)
-        results.add_row("", "Press / to search, Enter to play", "", "")
+        _placeholder(results, "Press / to search, Enter to play")
         queue = self.query_one("#queue-table", TrackTable)
         queue.add_column("#", width=4)
         queue.add_column("Title", width=50)
         queue.add_column("Artist", width=46)
         queue.add_column("Dur", width=6)
         self.query_one("#search", Input).focus()
+        theme = os.environ.get("YT_TUI_THEME")
+        if theme and theme in self.available_themes:
+            self.theme = theme
+        # Mode chip + hints follow focus (Screen.focused is reactive).
+        self.watch(self.screen, "focused", self._sync_bar, init=False)
+        self._sync_bar()
         self._start_mpv()
 
     def shutdown(self) -> None:
@@ -279,7 +259,20 @@ class YTMusicTUI(App):
             self._sync_bar()
 
     # -- playback -----------------------------------------------------------
+    @property
+    def _mode(self) -> str:
+        return "insert" if isinstance(self.focused, Input) else "normal"
+
+    @property
+    def _active_tab(self) -> str:
+        return self.query_one("#tabs", TabbedContent).active
+
+    @on(TabbedContent.TabActivated)
+    def _on_tab_activated(self) -> None:
+        self._sync_bar()
+
     def _sync_bar(self) -> None:
+        mode = self._mode
         bar = self.query_one("#player-bar", PlayerBar)
         bar.sync(
             track=self.queue.current,
@@ -290,9 +283,12 @@ class YTMusicTUI(App):
             volume=self.volume,
             queue_index=(self.queue.cursor + 1) if self.queue.current else 0,
             queue_length=len(self.queue),
+            mode=mode,
+            hints=hints_for(mode, self._active_tab),
         )
 
     def _load_current(self) -> None:
+        self._rebuild_results()
         track = self.queue.current
         if track is None:
             self.playing = False
@@ -320,6 +316,7 @@ class YTMusicTUI(App):
             self.duration = None
             self.notify("Queue finished", timeout=4)
             self._rebuild_queue()
+            self._rebuild_results()
             self._sync_bar()
             return
         self._rebuild_queue()
@@ -346,13 +343,13 @@ class YTMusicTUI(App):
         if not query:
             self._results = []
             table.clear()
-            table.add_row("", "Press / to search, Enter to play", "", "")
+            _placeholder(table, "Press / to search, Enter to play")
             return
         self._search_token += 1
         token = self._search_token
         self._results = []
         table.clear()
-        table.add_row("", f"Searching “{query}”…", "", "")
+        _placeholder(table, f"Searching “{query}”…")
         self._search(query, token)
 
     @work(thread=True, exclusive=True, group="search", exit_on_error=False)
@@ -369,27 +366,59 @@ class YTMusicTUI(App):
             return  # stale response from an older query
         self._results = tracks
         table = self.query_one("#results-table", TrackTable)
-        table.clear()
         if not tracks:
-            table.add_row("", "No results", "", "")
+            table.clear()
+            _placeholder(table, "No results")
             return
-        for track in tracks:
-            table.add_row(track.title, track.artist_str, track.album or "", track.duration_str)
+        self._rebuild_results()
         table.move_cursor(row=0)
+
+    def _rebuild_results(self) -> None:
+        """Re-render result rows, marking the playing track with ▶."""
+        if not self._results:
+            return
+        table = self.query_one("#results-table", TrackTable)
+        cursor = table.cursor_row
+        table.clear()
+        current = self.queue.current
+        for track in self._results:
+            playing = current is not None and track.video_id == current.video_id
+            if playing:
+                table.add_row(
+                    Text(f"▶ {track.title}", style="bold green"),
+                    Text(track.artist_str, style="green"),
+                    track.album or "",
+                    track.duration_str,
+                )
+            else:
+                table.add_row(
+                    track.title, track.artist_str, track.album or "", track.duration_str
+                )
+        if table.row_count:
+            table.move_cursor(row=min(max(cursor, 0), table.row_count - 1))
 
     def _search_failed(self, token: int, error: str) -> None:
         if token != self._search_token:
             return
         table = self.query_one("#results-table", TrackTable)
         table.clear()
-        table.add_row("", f"Search failed: {error}", "", "")
+        _placeholder(table, f"Search failed: {error}")
 
     # -- queue table --------------------------------------------------------
     def _rebuild_queue(self) -> None:
         table = self.query_one("#queue-table", TrackTable)
         table.clear()
         for index, track in enumerate(self.queue.items, start=1):
-            table.add_row(str(index), track.title, track.artist_str, track.duration_str)
+            is_current = self.queue.current is not None and index - 1 == self.queue.cursor
+            if is_current:
+                table.add_row(
+                    Text("▶", style="bold green"),
+                    Text(track.title, style="bold green"),
+                    Text(track.artist_str, style="green"),
+                    track.duration_str,
+                )
+            else:
+                table.add_row(str(index), track.title, track.artist_str, track.duration_str)
         if self.queue.current is not None:
             table.move_cursor(row=self.queue.cursor)
         try:
@@ -423,12 +452,96 @@ class YTMusicTUI(App):
         self._load_current()
 
     # -- actions ------------------------------------------------------------
+    def _active_table(self) -> TrackTable | None:
+        """Table of the active tab (none while typing in the search input)."""
+        if isinstance(self.focused, Input):
+            return None
+        tid = "#queue-table" if self._active_tab == "queue" else "#results-table"
+        return self.query_one(tid, TrackTable)
+
     def action_focus_search(self) -> None:
         self.query_one("#search", Input).focus()
+
+    def action_show_results(self) -> None:
+        self.query_one("#tabs", TabbedContent).active = "results"
+        self.query_one("#results-table", TrackTable).focus()
 
     def action_show_queue(self) -> None:
         self.query_one("#tabs", TabbedContent).active = "queue"
         self.query_one("#queue-table", TrackTable).focus()
+
+    # -- vim navigation ------------------------------------------------------
+    def action_cursor_down(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            table.move_cursor(row=min(table.cursor_row + 1, table.row_count - 1))
+
+    def action_cursor_up(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            table.move_cursor(row=max(table.cursor_row - 1, 0))
+
+    def action_g_prefix(self) -> None:
+        """`g` starts the gg sequence; a second `g` within 1s jumps to top."""
+        if self._g_pending:
+            self._clear_g_prefix()
+            self.action_scroll_first()
+            return
+        self._g_pending = True
+        if self._g_timer is not None:
+            self._g_timer.stop()
+        self._g_timer = self.set_timer(G_PREFIX_TIMEOUT, self._clear_g_prefix)
+
+    def _clear_g_prefix(self) -> None:
+        self._g_pending = False
+        self._g_timer = None
+
+    def action_scroll_first(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            table.move_cursor(row=0)
+
+    def action_scroll_last(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            table.move_cursor(row=table.row_count - 1)
+
+    def _visible_rows(self, table: TrackTable) -> int:
+        height = table.size.height or 20
+        return max(1, (height - 1) // 2)
+
+    def action_half_page_down(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            step = self._visible_rows(table)
+            table.move_cursor(row=min(table.cursor_row + step, table.row_count - 1))
+
+    def action_half_page_up(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            step = self._visible_rows(table)
+            table.move_cursor(row=max(table.cursor_row - step, 0))
+
+    def action_page_down(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            table.action_page_down()
+
+    def action_page_up(self) -> None:
+        table = self._active_table()
+        if table is not None and table.row_count:
+            table.action_page_up()
+
+    def action_cycle_theme(self) -> None:
+        names = list(self.available_themes)
+        if not names:
+            return
+        try:
+            nxt = (names.index(self.theme) + 1) % len(names)
+        except ValueError:
+            nxt = 0
+        self.theme = names[nxt]
+        self.notify(f"theme: {names[nxt]}", timeout=2, markup=False)
 
     def action_go_back(self) -> None:
         if isinstance(self.focused, Input):
@@ -537,6 +650,7 @@ class YTMusicTUI(App):
         self.paused = False
         self.position = None
         self.duration = None
+        self._rebuild_results()
         if self.mpv.is_running:
             try:
                 self.mpv.command("stop")
@@ -545,4 +659,4 @@ class YTMusicTUI(App):
         self._sync_bar()
 
     def action_show_help(self) -> None:
-        self.notify(HINTS, title="Keys", timeout=10, markup=False)
+        self.push_screen(HelpScreen())
