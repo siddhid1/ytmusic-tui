@@ -1,0 +1,48 @@
+"""Data models for tracks and search results."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+
+def format_duration(seconds: int | None) -> str:
+    """Format seconds as m:ss (or h:mm:ss when >= 1 hour)."""
+    if seconds is None or seconds < 0:
+        return "--:--"
+    seconds = int(seconds)
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+@dataclass(frozen=True, slots=True)
+class Track:
+    video_id: str
+    title: str
+    artists: tuple[str, ...] = ()
+    album: str | None = None
+    duration: int | None = None  # seconds
+
+    @property
+    def artist_str(self) -> str:
+        return ", ".join(self.artists) if self.artists else "Unknown artist"
+
+    @property
+    def url(self) -> str:
+        return f"https://music.youtube.com/watch?v={self.video_id}"
+
+    @property
+    def duration_str(self) -> str:
+        return format_duration(self.duration)
+
+    @property
+    def display_title(self) -> str:
+        return f"{self.title} — {self.artist_str}"
+
+
+@dataclass(slots=True)
+class SearchResult:
+    query: str
+    tracks: list[Track] = field(default_factory=list)
