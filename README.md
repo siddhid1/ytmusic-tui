@@ -6,9 +6,16 @@ without ever leaving the keyboard — a Textual TUI backed by `mpv`.
 ## Features
 
 - **Live search** — debounced YouTube Music song search as you type
+- **Vim-style navigation** — `hjkl`, `gg`/`G`, `ctrl+d/u/f/b`, vim `?` help overlay,
+  and a `-- NORMAL --` / `-- INSERT --` mode chip (focus *is* the mode: typing in
+  search = INSERT, tables = NORMAL)
+- **Vim statusline** — mode, now-playing, progress, volume, queue position, plus a
+  context-sensitive hint line that changes per tab/mode
 - **Instant playback** — `Enter` on a result streams it through `mpv`
-- **Queue management** — add, remove, jump-to; auto-advances when a track ends
-- **Player bar** — now playing, progress bar, elapsed/total time, volume, queue position
+- **Queue management** — add, remove, jump-to; auto-advances when a track ends;
+  the playing track is marked with a green `▶` in both the results and the queue
+- **Themes** — cycle 21 built-in Textual themes with `t` (`YT_TUI_THEME=gruvbox`
+  to pick one at startup)
 - **Transport controls** — pause/resume, next/previous, seek ±5s, volume up/down
 - **Resilient playback** — transient stream failures (e.g. YouTube HTTP 403) are
   retried once, then skipped with a toast notification
@@ -21,6 +28,7 @@ Textual app (asyncio event loop)
   ├── search input ──debounce──► worker thread ──► ytmusicapi ──► YouTube Music API
   │                                   │ (results marshalled back via call_from_thread)
   ├── QueueModel  (pure Python: items + cursor, unit-tested, no I/O)
+  ├── widgets.py  (statusline PlayerBar, mode chip, hints, help overlay)
   └── MpvClient   (unix-socket JSON IPC, dedicated reader thread)
         └── mpv --idle=yes ──► yt-dlp resolves music.youtube.com/watch?v=…
                                 └──► ffmpeg streams audio to your sound server
@@ -39,6 +47,12 @@ Textual app (asyncio event loop)
    player bar; `time-pos` is throttled to 4 Hz to keep redraws cheap.
 5. On `end-file` → the queue cursor advances and the next track loads.
    `reason=error` retries the same track once, then skips with a toast.
+
+**Vim modes.** Focus defines the mode: with the search input focused you are in
+`-- INSERT --` (typing searches live), with a table focused you are in
+`-- NORMAL --` where all the navigation keys work. `esc` always returns to
+NORMAL; `/` enters INSERT. The mode chip and hint line re-render off
+`Screen.focused` (a reactive), so they never go stale.
 
 **Why our own queue instead of mpv's playlist?** Reordering, inserting
 mid-queue, removing the currently playing track, and jumping around all need
@@ -69,36 +83,51 @@ python3 -m venv .venv
 
 ## Keybindings
 
+### NORMAL mode (table focused)
+
 | Key | Action |
 |---|---|
-| `/` | Focus search input |
-| `Enter` (search) | Search now, jump to results |
-| `Enter` (result) | Play now (or jump to it if already queued) |
-| `Enter` (queue) | Jump to / play that queue entry |
-| `↑`/`↓` or `j`/`k` | Move cursor |
-| `Tab` | Switch focus (search ↔ table) |
-| `q` | Open Queue tab |
+| `j` / `k` or `↑`/`↓` | Move cursor |
+| `gg` / `G` | First / last row |
+| `ctrl+d` / `ctrl+f` | Half / full page down |
+| `ctrl+u` / `ctrl+b` | Half / full page up |
+| `h` / `l` or `←`/`→` | Seek ∓5s |
 | `space` | Play / pause |
 | `n` / `p` | Next / previous (`p` restarts if >3s in) |
-| `←` / `→` | Seek ∓5s |
 | `+` / `-` | Volume up / down |
 | `a` | Add selected result to queue |
 | `d` | Remove selected queue entry |
-| `esc` | Back from search to results |
-| `?` | Show keybinding help |
+| `Enter` (result) | Play now (or jump to it if already queued) |
+| `Enter` (queue) | Jump to / play that queue entry |
+| `/` | Focus search → INSERT mode |
+| `r` / `q` | Results / Queue tab |
+| `Tab` | Cycle focus |
+| `t` | Cycle theme |
+| `?` | Toggle help overlay (`esc`/`q`/`?` closes; `j`/`k` scroll) |
 | `ctrl+q` | Quit |
+
+### INSERT mode (search focused)
+
+| Key | Action |
+|---|---|
+| type | Live search (debounced) |
+| `Enter` | Search now and jump to results |
+| `esc` | Back to NORMAL mode |
 
 ## Development
 
 ```bash
 .venv/bin/ruff check .   # lint
-.venv/bin/pytest         # unit tests (queue model, parsing)
+.venv/bin/pytest         # unit tests (queue, parsing, statusline helpers)
 ```
 
-Test coverage: the queue model and track/duration parsing are unit-tested.
-The full flow (search → play → queue ops → seek → pause → next) is verified
-end-to-end with Textual's headless pilot harness driving a real mpv against the
-`null` audio output (`YT_TUI_MPV_EXTRA="--ao=null"`).
+Test coverage: the queue model, track/duration parsing, and the statusline
+hint/progress helpers are unit-tested (30 tests).
+The full flow (search → play → queue ops → seek → pause → next → vim navigation
+`gg/G/j/k/ctrl+d` → `h/l` seek → mode chip → help overlay → theme cycling →
+`▶` markers) is verified end-to-end with Textual's headless pilot harness
+driving a real mpv against the `null` audio output
+(`YT_TUI_MPV_EXTRA="--ao=null"`).
 
 ## Troubleshooting
 
