@@ -46,3 +46,10 @@ class Track:
 class SearchResult:
     query: str
     tracks: list[Track] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
+class Playlist:
+    playlist_id: str
+    title: str
+    count: str | None = None  # ytmusicapi returns counts as strings ("5")

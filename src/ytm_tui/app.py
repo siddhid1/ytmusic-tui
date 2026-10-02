@@ -14,7 +14,7 @@ from textual.widgets import DataTable, Header, Input, TabbedContent, TabPane
 from .models import Track
 from .mpv_client import MpvClient, MpvError
 from .queue import QueueModel
-from .widgets import HelpScreen, PlayerBar, hints_for
+from .widgets import HelpScreen, LoginScreen, PlayerBar, hints_for
 from .ytm import YTMusicClient
 
 SEARCH_DEBOUNCE = 0.4
@@ -88,6 +88,21 @@ class YTMusicTUI(App):
     #help-content {
         width: 100%;
     }
+    #login-box {
+        width: 74;
+        max-width: 94%;
+        height: auto;
+        max-height: 85%;
+        border: tall $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #login-status {
+        margin-top: 1;
+    }
+    #login-hints {
+        margin-top: 1;
+    }
     """
 
     BINDINGS = [
@@ -117,6 +132,7 @@ class YTMusicTUI(App):
         Binding("t", "cycle_theme", "Theme", show=False),
         Binding("escape", "go_back", "Back", show=False),
         Binding("?", "show_help", "Help", show=False),
+        Binding("ctrl+l", "login", "Login", show=False),
     ]
 
     def __init__(self) -> None:
@@ -138,6 +154,8 @@ class YTMusicTUI(App):
         self._error_retries = 0
         self._g_pending = False
         self._g_timer: Any = None
+        self._marked: set[str] = set()
+        self._playlists: list[Any] | None = None
 
     # -- composition --------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -660,3 +678,25 @@ class YTMusicTUI(App):
 
     def action_show_help(self) -> None:
         self.push_screen(HelpScreen())
+
+    # -- login ---------------------------------------------------------------
+    def action_login(self) -> None:
+        if self.ytm.authed:
+            self.notify("Already logged in", timeout=3)
+            return
+        self.push_screen(LoginScreen(), self._login_done)
+
+    def _login_done(self, success: bool) -> None:
+        if not success:
+            return
+        if self.ytm.enable_auth():
+            self._playlists = None  # stale guest cache
+            self.notify("Logged in — saved playlists available", title="Account", timeout=4)
+        else:
+            self.notify(
+                "Token stored but could not be loaded",
+                title="Login",
+                severity="error",
+                timeout=8,
+            )
+        self._sync_bar()

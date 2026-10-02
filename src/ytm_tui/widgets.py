@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import threading
+import webbrowser
 from typing import Any
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
+from . import auth
 from .models import Track, format_duration
 
 PROGRESS_WIDTH = 24
@@ -203,3 +207,153 @@ class HelpScreen(ModalScreen[None]):
 
     def action_scroll_bottom(self) -> None:
         self._box().scroll_end(animate=False)
+
+
+CREDS_HELP = """\
+[b]One-time setup — Google Cloud Console[/b]
+  1. console.cloud.google.com → APIs & Services → Credentials
+  2. Create credentials → OAuth client ID
+  3. Application type: [b]TVs and Limited Input devices[/b]
+  4. Paste the client ID and secret below
+
+Stored only in ~/.config/yt-tui-player/ (mode 600).
+"""
+
+FLOW_HELP = """\
+[b]Approve the login[/b]
+  Open the URL below on any device, enter the code,
+  and pick your YouTube Music account.
+"""
+
+
+class LoginScreen(ModalScreen[bool]):
+    """Device-code login: paste Google OAuth client credentials, then approve.
+
+    Dismisses True on success, False on cancel. Runs the ytmusicapi device flow
+    in workers; cancellation is cooperative via a threading.Event.
+    """
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("q", "cancel", "Cancel", show=False),
+        Binding("enter", "confirm", "Continue", show=False),
+        Binding("o", "open_browser", "Open browser", show=False),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.stage = "creds"  # creds | code | polling
+        self._cancelled = threading.Event()
+        self._code: auth.DeviceCode | None = None
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="login-box"):
+            yield Static(id="login-help")
+            yield Input(placeholder="OAuth client ID", id="client-id")
+            yield Input(placeholder="OAuth client secret", password=True, id="client-secret")
+            yield Static(id="login-status")
+            yield Static(id="login-hints")
+
+    def on_mount(self) -> None:
+        self.query_one("#login-help", Static).update(Text.from_markup(CREDS_HELP))
+        self._set_stage("creds")
+        saved = auth.load_client()
+        if saved is not None:
+            self.query_one("#client-id", Input).value = saved[0]
+            self.query_one("#client-secret", Input).value = saved[1]
+            # credentials already stored: skip straight to requesting a code
+            self.action_confirm()
+        else:
+            self.query_one("#client-id", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "client-id":
+            self.query_one("#client-secret", Input).focus()
+        else:
+            self.action_confirm()
+
+    # -- state ---------------------------------------------------------------
+    def _set_stage(self, stage: str) -> None:
+        self.stage = stage
+        show_creds = stage == "creds"
+        self.query_one("#client-id", Input).display = show_creds
+        self.query_one("#client-secret", Input).display = show_creds
+        if show_creds:
+            hints = "enter save & continue · esc cancel"
+        else:
+            hints = "o open browser · esc cancel"
+        self.query_one("#login-hints", Static).update(Text(hints, style="dim"))
+        if show_creds:
+            self.query_one("#client-id", Input).focus()
+
+    def _set_status(self, text: Text) -> None:
+        self.query_one("#login-status", Static).update(text)
+
+    # -- flow ----------------------------------------------------------------
+    def action_confirm(self) -> None:
+        if self.stage != "creds":
+            return
+        client_id = self.query_one("#client-id", Input).value.strip()
+        client_secret = self.query_one("#client-secret", Input).value.strip()
+        if not client_id or not client_secret:
+            self._set_status(Text("Both client ID and secret are required", style="red"))
+            return
+        auth.save_client(client_id, client_secret)
+        self._start_flow()
+
+    def _start_flow(self) -> None:
+        self._set_stage("code")
+        self.query_one("#login-help", Static).update(Text.from_markup(FLOW_HELP))
+        self._set_status(Text("Requesting login code…", style="dim"))
+        self._request_code()
+
+    @work(thread=True, exclusive=True, group="login")
+    def _request_code(self) -> None:
+        try:
+            code = auth.begin_device_flow()
+        except auth.PollError as exc:
+            self.call_from_thread(self._flow_failed, str(exc))
+            return
+        self.call_from_thread(self._show_code, code)
+
+    def _show_code(self, code: auth.DeviceCode) -> None:
+        self._code = code
+        self._set_stage("polling")
+        status = Text()
+        status.append(f"  {code.url}\n", style="bold underline")
+        status.append(f"  code: {code.user_code}\n", style="bold yellow")
+        status.append(
+            f"  waiting for approval ({code.expires_in}s timeout)…",
+            style="dim",
+        )
+        self._set_status(status)
+        self._poll(code)
+
+    @work(thread=True, exclusive=True, group="login")
+    def _poll(self, code: auth.DeviceCode) -> None:
+        try:
+            auth.poll_for_token(code, should_cancel=self._cancelled.is_set)
+        except auth.CancelledLogin:
+            return
+        except auth.PollError as exc:
+            self.call_from_thread(self._flow_failed, str(exc))
+            return
+        self.call_from_thread(self._login_succeeded)
+
+    def _flow_failed(self, message: str) -> None:
+        self._set_stage("creds")
+        self.query_one("#login-help", Static).update(Text.from_markup(CREDS_HELP))
+        self._set_status(Text(message, style="red"))
+
+    def _login_succeeded(self) -> None:
+        self.dismiss(True)
+
+    # -- keys ----------------------------------------------------------------
+    def action_cancel(self) -> None:
+        self._cancelled.set()
+        self.dismiss(False)
+
+    def action_open_browser(self) -> None:
+        if self._code is None:
+            return
+        webbrowser.open(self._code.url)

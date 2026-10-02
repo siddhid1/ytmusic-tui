@@ -138,9 +138,7 @@ class MpvClient:
                     self.close()
                     raise MpvError("timed out connecting to mpv IPC socket") from None
                 if self._proc.poll() is not None:
-                    raise MpvError(
-                        f"mpv exited early: {self._read_log_tail()}"
-                    ) from None
+                    raise MpvError(f"mpv exited early: {self._read_log_tail()}") from None
                 time.sleep(0.05)
 
         self._dead.clear()
