@@ -132,6 +132,26 @@ class TestPollForToken:
         with pytest.raises(auth.CancelledLogin):
             auth.poll_for_token(code, should_cancel=lambda: True, sleep=lambda _s: None)
 
+    def test_slow_down_bumps_interval_then_succeeds(self, fake_creds):
+        fake_creds.responses = [
+            {"error": "slow_down"},
+            {"error": "authorization_pending"},
+            dict(GOOD_TOKEN),
+        ]
+        code = auth.begin_device_flow()
+        sleeps: list[float] = []
+        token = auth.poll_for_token(code, sleep=sleeps.append)
+        assert token.access_token == "at-1"
+        assert sleeps == [6, 6]  # interval 1 -> 6 after slow_down, then reused
+
+    def test_missing_refresh_token_raises(self, fake_creds):
+        raw = dict(GOOD_TOKEN)
+        del raw["refresh_token"]
+        fake_creds.responses = [raw]
+        code = auth.begin_device_flow()
+        with pytest.raises(auth.PollError, match="refresh token"):
+            auth.poll_for_token(code, sleep=lambda _s: None)
+
     def test_missing_client_raises(self, monkeypatch):
         monkeypatch.setattr(auth, "OAuthCredentials", FakeCreds)
         with pytest.raises(auth.PollError, match="not configured"):

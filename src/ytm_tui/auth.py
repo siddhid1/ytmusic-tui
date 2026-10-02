@@ -130,6 +130,7 @@ def poll_for_token(
         raise PollError("OAuth client credentials are not configured")
     creds = OAuthCredentials(client[0], client[1])
     deadline = time.monotonic() + code.expires_in
+    interval = code.interval
 
     while True:
         if should_cancel is not None and should_cancel():
@@ -140,11 +141,13 @@ def poll_for_token(
         try:
             raw = creds.token_from_code(code.device_code)
         except requests.RequestException:
-            sleep(min(code.interval, remaining))
+            sleep(min(interval, remaining))
             continue
         except YTMusicError as exc:
             raise PollError(str(exc)) from exc
         if isinstance(raw, dict) and "access_token" in raw:
+            if "refresh_token" not in raw:
+                raise PollError("Google returned no refresh token — retry the login")
             refreshable = RefreshingToken(
                 credentials=creds,
                 access_token=raw["access_token"],
@@ -162,7 +165,11 @@ def poll_for_token(
             return refreshable
         error = raw.get("error") if isinstance(raw, dict) else None
         if error == "authorization_pending":
-            sleep(min(code.interval, remaining))
+            sleep(min(interval, remaining))
+            continue
+        if error == "slow_down":
+            interval += 5
+            sleep(min(interval, remaining))
             continue
         if error in ("expired_token", "access_denied"):
             raise PollError(f"Login {error.replace('_', ' ')}")
