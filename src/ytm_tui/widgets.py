@@ -12,7 +12,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Input, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from . import art, auth
@@ -170,7 +170,8 @@ HELP_TEXT = """\
 
 [b]Playlists[/b]
   A                    add marked songs to a playlist
-  ctrl+l               log in with Google (device code)
+  ctrl+l               sign in (Google device code)
+  ctrl+b               inside login: switch to browser sign-in
 
 [b]Other[/b]
   t                    cycle theme
@@ -249,24 +250,38 @@ FLOW_HELP = """\
   and pick your YouTube Music account.
 """
 
+BROWSER_HELP = """\
+[b]Sign in with your browser session[/b]
+  1. Open music.youtube.com and sign in
+  2. F12 → Network → pick a youtubei/v1 request
+     (browse, next or search work best)
+  3. Right-click → Copy → Copy as cURL (bash)
+  4. Paste below (whole command) and press enter
+
+Firefox: Copy → Copy Request Headers works too.
+No Google Cloud setup needed. Re-paste when the session expires.
+"""
+
 
 class LoginScreen(ModalScreen[bool]):
-    """Device-code login: paste Google OAuth client credentials, then approve.
+    """Sign-in: Google device-code OAuth, or paste browser-session headers.
 
-    Dismisses True on success, False on cancel. Runs the ytmusicapi device flow
-    in workers; cancellation is cooperative via a threading.Event.
+    Dismisses True on success, False on cancel. `ctrl+b` toggles the method
+    while on the credentials stage; all network work runs in workers.
     """
 
     BINDINGS = [
         Binding("escape", "cancel", "Cancel", show=False),
         Binding("q", "cancel", "Cancel", show=False),
-        Binding("enter", "confirm", "Continue", show=False),
+        Binding("enter", "confirm", "Continue", show=False, priority=True),
+        Binding("ctrl+b", "toggle_mode", "Switch method", show=False),
         Binding("o", "open_browser", "Open browser", show=False),
     ]
 
     def __init__(self) -> None:
         super().__init__()
         self.stage = "creds"  # creds | code | polling
+        self.mode = "oauth"  # oauth | browser
         self._cancelled = threading.Event()
         self._code: auth.DeviceCode | None = None
 
@@ -275,20 +290,16 @@ class LoginScreen(ModalScreen[bool]):
             yield Static(id="login-help")
             yield Input(placeholder="OAuth client ID", id="client-id")
             yield Input(placeholder="OAuth client secret", password=True, id="client-secret")
+            yield TextArea(id="headers-paste")
             yield Static(id="login-status")
             yield Static(id="login-hints")
 
     def on_mount(self) -> None:
-        self.query_one("#login-help", Static).update(Text.from_markup(CREDS_HELP))
-        self._set_stage("creds")
         saved = auth.load_client()
         if saved is not None:
             self.query_one("#client-id", Input).value = saved[0]
             self.query_one("#client-secret", Input).value = saved[1]
-            # credentials already stored: skip straight to requesting a code
-            self.action_confirm()
-        else:
-            self.query_one("#client-id", Input).focus()
+        self._set_stage("creds")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "client-id":
@@ -299,15 +310,31 @@ class LoginScreen(ModalScreen[bool]):
     # -- state ---------------------------------------------------------------
     def _set_stage(self, stage: str) -> None:
         self.stage = stage
-        show_creds = stage == "creds"
-        self.query_one("#client-id", Input).display = show_creds
-        self.query_one("#client-secret", Input).display = show_creds
-        if show_creds:
-            hints = "enter save & continue · esc cancel"
+        self._apply_view()
+
+    def _apply_view(self) -> None:
+        show_creds = self.stage == "creds"
+        browser = self.mode == "browser"
+        self.query_one("#client-id", Input).display = show_creds and not browser
+        self.query_one("#client-secret", Input).display = show_creds and not browser
+        self.query_one("#headers-paste", TextArea).display = show_creds and browser
+        if not show_creds:
+            self.query_one("#login-hints", Static).update(
+                Text("o open browser · esc cancel", style="dim")
+            )
+            return
+        self.query_one("#login-help", Static).update(
+            Text.from_markup(BROWSER_HELP if browser else CREDS_HELP)
+        )
+        if browser:
+            self.query_one("#login-hints", Static).update(
+                Text("enter sign in · ctrl+b google sign-in · esc cancel", style="dim")
+            )
+            self.query_one("#headers-paste", TextArea).focus()
         else:
-            hints = "o open browser · esc cancel"
-        self.query_one("#login-hints", Static).update(Text(hints, style="dim"))
-        if show_creds:
+            self.query_one("#login-hints", Static).update(
+                Text("enter continue · ctrl+b browser sign-in · esc cancel", style="dim")
+            )
             self.query_one("#client-id", Input).focus()
 
     def _set_status(self, text: Text) -> None:
@@ -316,6 +343,12 @@ class LoginScreen(ModalScreen[bool]):
     # -- flow ----------------------------------------------------------------
     def action_confirm(self) -> None:
         if self.stage != "creds":
+            return
+        if self.mode == "browser":
+            self._submit_headers()
+            return
+        if self.focused is not None and self.focused.id == "client-id":
+            self.query_one("#client-secret", Input).focus()
             return
         client_id = self.query_one("#client-id", Input).value.strip()
         client_secret = self.query_one("#client-secret", Input).value.strip()
@@ -336,11 +369,16 @@ class LoginScreen(ModalScreen[bool]):
         try:
             code = auth.begin_device_flow()
         except auth.PollError as exc:
-            self.call_from_thread(self._flow_failed, str(exc))
+            self.app.call_from_thread(self._flow_failed, str(exc))
             return
-        self.call_from_thread(self._show_code, code)
+        except Exception as exc:
+            self.app.call_from_thread(self._flow_failed, f"Could not get login code: {exc}")
+            return
+        self.app.call_from_thread(self._show_code, code)
 
     def _show_code(self, code: auth.DeviceCode) -> None:
+        if not self.is_attached:
+            return
         self._code = code
         self._set_stage("polling")
         status = Text()
@@ -360,19 +398,62 @@ class LoginScreen(ModalScreen[bool]):
         except auth.CancelledLogin:
             return
         except auth.PollError as exc:
-            self.call_from_thread(self._flow_failed, str(exc))
+            self.app.call_from_thread(self._flow_failed, str(exc))
             return
-        self.call_from_thread(self._login_succeeded)
+        except Exception as exc:
+            self.app.call_from_thread(self._flow_failed, f"Login failed: {exc}")
+            return
+        self.app.call_from_thread(self._login_succeeded)
 
     def _flow_failed(self, message: str) -> None:
+        if not self.is_attached:
+            return
         self._set_stage("creds")
-        self.query_one("#login-help", Static).update(Text.from_markup(CREDS_HELP))
         self._set_status(Text(message, style="red"))
 
     def _login_succeeded(self) -> None:
+        if not self.is_attached:
+            return
+        self.dismiss(True)
+
+    # -- browser-session sign-in --------------------------------------------
+    def _submit_headers(self) -> None:
+        raw = self.query_one("#headers-paste", TextArea).text.strip()
+        if not raw:
+            self._set_status(
+                Text("Paste the headers or a Copy as cURL (bash) command", style="red")
+            )
+            return
+        self._set_status(Text("Verifying session…", style="dim"))
+        self._verify_headers(raw)
+
+    @work(thread=True, exclusive=True, group="login")
+    def _verify_headers(self, raw: str) -> None:
+        try:
+            auth.save_browser_headers(raw)
+            info = auth.verify_browser_session()
+        except auth.HeadersError as exc:
+            self.app.call_from_thread(self._flow_failed, str(exc))
+            return
+        except Exception as exc:
+            self.app.call_from_thread(self._flow_failed, f"Sign-in failed: {exc}")
+            return
+        self.app.call_from_thread(self._headers_ok, info)
+
+    def _headers_ok(self, info: dict) -> None:
+        if not self.is_attached:
+            return
+        self.app._pending_account = info  # consumed by _login_done for the toast
         self.dismiss(True)
 
     # -- keys ----------------------------------------------------------------
+    def action_toggle_mode(self) -> None:
+        if self.stage != "creds":
+            return
+        self.mode = "browser" if self.mode == "oauth" else "oauth"
+        self._set_status(Text(""))
+        self._apply_view()
+
     def action_cancel(self) -> None:
         self._cancelled.set()
         self.dismiss(False)
@@ -479,9 +560,9 @@ class PlaylistPicker(ModalScreen[str | None]):
         try:
             playlists = self.app.ytm.list_playlists()
         except Exception as exc:  # network / auth errors surface in the picker
-            self.call_from_thread(self._fetch_failed, str(exc))
+            self.app.call_from_thread(self._fetch_failed, str(exc))
             return
-        self.call_from_thread(self._fetch_done, playlists)
+        self.app.call_from_thread(self._fetch_done, playlists)
 
     def _fetch_done(self, playlists: list[Playlist]) -> None:
         if not self.is_attached:

@@ -120,6 +120,10 @@ class YTMusicTUI(App):
     #login-status {
         margin-top: 1;
     }
+    #headers-paste {
+        height: 9;
+        margin-top: 1;
+    }
     #login-hints {
         margin-top: 1;
     }
@@ -196,6 +200,7 @@ class YTMusicTUI(App):
         self._results: list[Track] = []
         self._search_token = 0
         self._search_timer: Any = None
+        self._pending_account: dict[str, Any] | None = None
         self.playing = False
         self.paused = False
         self.position: float | None = None
@@ -278,6 +283,9 @@ class YTMusicTUI(App):
             )
 
     def _mpv_event_from_thread(self, event: dict[str, Any]) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return  # app is shutting down; call_from_thread would orphan a coroutine
         self.call_from_thread(self._on_mpv_event, event)
 
     def _on_mpv_event(self, event: dict[str, Any]) -> None:
@@ -891,13 +899,31 @@ class YTMusicTUI(App):
 
     def _login_done(self, success: bool) -> None:
         if not success:
+            self.notify(
+                "Login not completed — press ctrl+l to retry",
+                title="Login",
+                severity="warning",
+                timeout=5,
+            )
             return
         if self.ytm.enable_auth():
             self._playlists = None  # stale guest cache
-            self.notify("Logged in — saved playlists available", title="Account", timeout=4)
+            info = self._pending_account
+            self._pending_account = None
+            if info:
+                name = str(info.get("accountName") or "")
+                handle = str(info.get("channelHandle") or "")
+                who = f"{name} {handle}".strip()
+                self.notify(
+                    f"Logged in as {who or 'YouTube Music'} — playlists available",
+                    title="Account",
+                    timeout=5,
+                )
+            else:
+                self.notify("Logged in — saved playlists available", title="Account", timeout=4)
         else:
             self.notify(
-                "Token stored but could not be loaded",
+                "Saved login could not be loaded",
                 title="Login",
                 severity="error",
                 timeout=8,

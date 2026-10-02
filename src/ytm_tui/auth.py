@@ -9,18 +9,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
+from ytmusicapi import YTMusic
 from ytmusicapi.auth.oauth import OAuthCredentials, RefreshingToken
 from ytmusicapi.exceptions import YTMusicError
 
 CONFIG_NAME = "yt-tui-player"
 CLIENT_FILE = "oauth_client.json"
 TOKEN_FILE = "oauth.json"
+BROWSER_FILE = "browser_headers.json"
 
 
 def config_dir() -> Path:
@@ -72,6 +75,139 @@ def save_client(client_id: str, client_secret: str) -> None:
 
 def has_login() -> bool:
     return load_client() is not None and token_path().is_file()
+
+
+# -- browser-session sign-in -------------------------------------------------
+
+
+class HeadersError(RuntimeError):
+    """Pasted browser headers could not be parsed or are no longer valid."""
+
+
+def browser_path() -> Path:
+    return config_dir() / BROWSER_FILE
+
+
+def has_browser_login() -> bool:
+    return browser_path().is_file()
+
+
+_CURL_START = re.compile(r"^\s*curl(?:\.exe)?\b", re.IGNORECASE)
+_CURL_HEADER = re.compile(r"""(?<![\w-])(?:-H|--header)\s+(?:'((?:[^']|'\\'')*)'|"([^"]*)")""")
+_CMD_ESCAPED_QUOTE = re.compile(r"(?:\^|`)[\"']")
+_DROP_EXACT = {"host", "content-length", "accept-encoding"}
+
+
+def _curl_to_header_lines(raw: str) -> str:
+    """Convert Chrome/Brave "Copy as cURL (bash)" output to header lines.
+
+    Plain header pastes pass through untouched; anything we cannot parse
+    raises HeadersError with instructions instead of failing opaquely later.
+    """
+    if not _CURL_START.match(raw):
+        return raw
+    pairs = []
+    for match in _CURL_HEADER.finditer(raw):
+        value = match.group(1) if match.group(1) is not None else match.group(2)
+        if value is None:
+            continue
+        value = value.replace("'\\''", "'")
+        name, sep, rest = value.partition(":")
+        if not sep:
+            continue
+        pairs.append(f"{name.strip()}: {rest.strip()}")
+    if not pairs:
+        if _CMD_ESCAPED_QUOTE.search(raw):
+            raise HeadersError(
+                "cURL (cmd/PowerShell) quoting is not supported — use Copy as cURL (bash)"
+            )
+        raise HeadersError(
+            "No -H headers found — copy a signed-in youtubei/v1 request with Copy as cURL (bash)"
+        )
+    return "\n".join(pairs)
+
+
+def _strip_pseudo_headers(raw: str) -> str:
+    """Drop HTTP/2 pseudo-header pairs (:authority, :method, ...).
+
+    In two-line DevTools format the value line would otherwise be parsed
+    as a header name, and colon-format keys would crash requests.
+    """
+    lines = raw.splitlines()
+    kept: list[str] = []
+    skip_value = False
+    for line in lines:
+        if skip_value:
+            skip_value = False
+            continue
+        stripped = line.strip()
+        if stripped.startswith(":"):
+            if ":" not in stripped[1:]:
+                skip_value = True
+            continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
+def _clean_saved_headers(data: dict) -> dict:
+    """Drop leftovers the library's lowercase-only filter misses.
+
+    ``accept-encoding`` is dropped (not normalized): requests then applies
+    its own ``gzip, deflate`` default, which urllib3 can actually decode.
+    """
+    cleaned = {}
+    for key, value in data.items():
+        low = key.lower()
+        if low.startswith(":") or low.startswith("sec") or low in _DROP_EXACT:
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def save_browser_headers(raw: str) -> None:
+    """Parse pasted devtools headers or cURL (bash) into browser_headers.json.
+
+    Writes to a temp file, structurally validates it by constructing a client
+    (no network), and only then replaces any previously stored headers.
+    """
+    from ytmusicapi.auth.browser import setup_browser
+
+    target = browser_path()
+    tmp = target.with_name(target.name + ".tmp")
+    try:
+        raw = _strip_pseudo_headers(_curl_to_header_lines(raw))
+        try:
+            setup_browser(filepath=str(tmp), headers_raw=raw)
+        except YTMusicError as exc:
+            raise HeadersError(str(exc)) from exc
+        data = json.loads(tmp.read_text(encoding="utf-8"))
+        # type detection needs a SAPISIDHASH marker; the real header is
+        # regenerated from the cookie on every request
+        if "SAPISIDHASH" not in str(data.get("authorization", "")):
+            data["authorization"] = "SAPISIDHASH0:0"
+        data = _clean_saved_headers(data)
+        _write_private(tmp, data)
+        try:
+            YTMusic(auth=str(tmp))
+        except YTMusicError as exc:
+            raise HeadersError(str(exc)) from exc
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def verify_browser_session() -> dict:
+    """Live account check for the saved headers; deletes them when rejected."""
+    path = browser_path()
+    try:
+        info = YTMusic(auth=str(path)).get_account_info()
+    except Exception as exc:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HeadersError(f"Browser session rejected: {exc}") from exc
+    return info if isinstance(info, dict) else {}
 
 
 @dataclass

@@ -40,13 +40,15 @@ def art_url(url: str, size: int = 320) -> str:
 
 
 def _build_yt() -> YTMusic:
-    """Guest client, or an authenticated one when oauth files are present."""
+    """Guest, OAuth, or browser-session client (OAuth wins when a token exists)."""
     client = auth.load_client()
     if auth.has_login() and client is not None:
         return YTMusic(
             auth=str(auth.token_path()),
             oauth_credentials=OAuthCredentials(client[0], client[1]),
         )
+    if auth.has_browser_login():
+        return YTMusic(auth=str(auth.browser_path()))
     return YTMusic()
 
 

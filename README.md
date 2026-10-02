@@ -17,10 +17,14 @@ without ever leaving the keyboard — a Textual TUI backed by `mpv`.
 - **Multi-select → playlists** — `s` toggles ● marks on songs, `S` clears them,
   and `A` adds all marked songs to one of your saved YouTube Music playlists
   (falls back to the cursor row when nothing is marked)
-- **Google login** — optional device-code OAuth (`ctrl+l`): paste your own OAuth
-  client credentials once, approve a code on any device, and the refreshing
-  token is stored locally (mode 600). Login unlocks your saved playlists;
-  search and playback work logged-out
+- **Two sign-in methods** — optional, unlocks your saved playlists (`A` picker);
+  search and playback work logged-out either way:
+  * **Browser session** (`ctrl+l` → `ctrl+b`) — paste a *Copy as cURL (bash)*
+    command (or raw request headers) copied from a logged-in music.youtube.com
+    tab. No Google Cloud setup at all; re-paste whenever the session expires.
+  * **Google device-code OAuth** (`ctrl+l`) — paste your own OAuth client
+    credentials once, approve a code on any device; the refreshing token is
+    stored locally (mode 600).
 - **Album art** — the now-playing cover renders as truecolor half-blocks in a
   right-hand column with title/artist/duration beneath; auto-hides below 110
   columns so the tables keep their width
@@ -117,7 +121,8 @@ python3 -m venv .venv
 | `Tab` | Cycle focus |
 | `t` | Cycle theme |
 | `?` | Toggle help overlay (`esc`/`q`/`?` closes; `j`/`k` scroll) |
-| `ctrl+l` | Log in with Google (device-code OAuth) |
+| `ctrl+l` | Log in (Google device-code OAuth) |
+| `ctrl+b` | Inside login: switch to browser-session sign-in |
 | `ctrl+q` | Quit |
 
 ### INSERT mode (search focused)
@@ -131,11 +136,30 @@ python3 -m venv .venv
 ## Sign in (optional)
 
 Login unlocks the `A` playlist picker; search and playback work without it.
+Two methods — pick either:
+
+### Browser session (no Google Cloud needed)
+
+1. In a browser, open [music.youtube.com](https://music.youtube.com) and sign in.
+2. `F12` → **Network** tab → click any `youtubei/v1/…` request → right-click it →
+   **Copy → Copy as cURL (bash)** (Firefox: **Copy → Copy Request Headers**;
+   manual fallback: select the whole *Request Headers* block — it must include
+   `cookie` and `x-goog-authuser`).
+3. In the app press `ctrl+l` → **`ctrl+b`** → paste → **Enter**. Both the
+   cURL command and raw header lines are accepted.
+4. The app verifies the session against your account and shows
+   *"Logged in as …"* — stored as `browser_headers.json` (mode 600).
+
+Re-paste with the same steps whenever the session expires (password change,
+browser logout, etc.); the app tells you when it is rejected.
+
+### Google device-code OAuth
 
 1. One-time: create OAuth client credentials in the
    [Google Cloud Console](https://console.cloud.google.com) —
    *APIs & Services → Credentials → Create credentials → OAuth client ID →
-   Application type: **TVs and Limited Input devices***.
+   Application type: **TVs and Limited Input devices*** — and either publish
+   the OAuth consent screen or add your account under *Test users*.
 2. In the app press `ctrl+l` and paste the client ID and secret (stored in
    `~/.config/yt-tui-player/`, mode 600 — never committed anywhere).
 3. Open the shown URL on any device, enter the code, and approve.
@@ -149,13 +173,14 @@ Login unlocks the `A` playlist picker; search and playback work without it.
 ```
 
 Test coverage: the queue model, track/duration parsing, statusline
-hint/progress helpers, the OAuth config/device-poll loop (mocked), multi-select
-mark logic, and album-art URL/thumbnail/half-block rendering — **67 tests**.
+hint/progress helpers, the OAuth config/device-poll loop (mocked),
+browser-header parsing/storage and client-priority selection, multi-select
+mark logic, and album-art URL/thumbnail/half-block rendering — **85 tests**.
 The full flow (search → mark `s` → playlist picker → guest login screen →
-queue ops → playback with real album art → resize auto-hide → help overlay →
-`ctrl+l` → theme/seek/volume) is verified end-to-end with Textual's headless
-pilot harness driving a real mpv against the `null` audio output
-(`YT_TUI_MPV_EXTRA="--ao=null"`).
+login method toggle → queue ops → playback with real album art → resize
+auto-hide → help overlay → `ctrl+l` → theme/seek/volume) is verified
+end-to-end with Textual's headless pilot harness driving a real mpv against
+the `null` audio output (`YT_TUI_MPV_EXTRA="--ao=null"`).
 
 ## Troubleshooting
 
@@ -167,6 +192,14 @@ pilot harness driving a real mpv against the `null` audio output
 - **Login rejected (`invalid_client` / `unauthorized_client`)** — client ID and
   secret don't match, or the OAuth client type isn't *TVs and Limited Input
   devices*. Press `ctrl+l` and paste corrected credentials.
+- **`403 access_denied` on the approval page ("app has not completed Google
+  verification")** — the OAuth consent screen is in *Testing* and your account
+  isn't a test user. Either *Publish app* / add a test user under
+  *APIs & Services → OAuth consent screen*, **or skip OAuth entirely**: sign in
+  with browser-session headers (`ctrl+l` → `ctrl+b`).
+- **"Browser session rejected"** — the pasted cookies expired or belong to a
+  different site. Re-copy the headers from music.youtube.com and paste again
+  (`ctrl+l` → `ctrl+b`).
 - **Login code expired** — approve faster, or press `ctrl+l` to fetch a new code.
 - **mpv debug log** — written to `/tmp/yt-tui-mpv-<pid>.log`.
 
