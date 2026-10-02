@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 
 from ytmusicapi import YTMusic
@@ -12,6 +13,30 @@ from . import auth
 from .models import Playlist, Track
 
 _MAX_RESULTS = 25
+
+
+def _best_thumbnail(item: dict) -> str | None:
+    """Largest thumbnail URL from a search/watch item (sizes vary per source)."""
+    thumbs = item.get("thumbnails")
+    if not isinstance(thumbs, list):
+        return None
+    best_url: str | None = None
+    best_width = -1
+    for thumb in thumbs:
+        if not isinstance(thumb, dict):
+            continue
+        url = thumb.get("url")
+        if not isinstance(url, str):
+            continue
+        width = thumb.get("width") or 0
+        if width >= best_width:
+            best_url, best_width = url, width
+    return best_url
+
+
+def art_url(url: str, size: int = 320) -> str:
+    """Rewrite a googleusercontent thumbnail URL to the requested square size."""
+    return re.sub(r"=w\d+-h\d+", f"=w{size}-h{size}", url, count=1)
 
 
 def _build_yt() -> YTMusic:
@@ -56,6 +81,7 @@ def _to_track(item: dict) -> Track | None:
         artists=artists,
         album=album,
         duration=_parse_duration(item.get("duration")),
+        thumbnail=_best_thumbnail(item),
     )
 
 

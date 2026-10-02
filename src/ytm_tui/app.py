@@ -6,21 +6,30 @@ import os
 from typing import Any
 
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Header, Input, TabbedContent, TabPane
 
+from . import art
 from .models import Playlist, Track
 from .mpv_client import MpvClient, MpvError
 from .queue import QueueModel
-from .widgets import HelpScreen, LoginScreen, PlayerBar, PlaylistPicker, hints_for
-from .ytm import YTMusicClient
+from .widgets import (
+    HelpScreen,
+    LoginScreen,
+    NowPlayingPanel,
+    PlayerBar,
+    PlaylistPicker,
+    hints_for,
+)
+from .ytm import YTMusicClient, art_url
 
 SEARCH_DEBOUNCE = 0.4
 SEEK_STEP = 5.0
 VOLUME_STEP = 5
 G_PREFIX_TIMEOUT = 1.0
+ART_PANEL_MIN_WIDTH = 110
 
 
 class TrackTable(DataTable, inherit_bindings=False):
@@ -127,6 +136,20 @@ class YTMusicTUI(App):
         height: auto;
         max-height: 20;
     }
+    #art-panel {
+        dock: right;
+        width: 19;
+        background: $panel;
+        padding: 0 1;
+        border-left: solid $accent;
+    }
+    #art-image {
+        width: 100%;
+    }
+    #art-meta {
+        width: 100%;
+        margin-top: 1;
+    }
     """
 
     BINDINGS = [
@@ -184,6 +207,7 @@ class YTMusicTUI(App):
         self._marked: set[str] = set()
         self._playlists: list[Playlist] | None = None
         self._pending_add: list[Track] | None = None
+        self._art_token = 0
 
     # -- composition --------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -202,6 +226,7 @@ class YTMusicTUI(App):
                     cursor_type="row",
                     zebra_stripes=True,
                 )
+        yield NowPlayingPanel(id="art-panel")
         yield PlayerBar(id="player-bar")
 
     def on_mount(self) -> None:
@@ -223,7 +248,13 @@ class YTMusicTUI(App):
         # Mode chip + hints follow focus (Screen.focused is reactive).
         self.watch(self.screen, "focused", self._sync_bar, init=False)
         self._sync_bar()
+        self._update_art(None)
         self._start_mpv()
+
+    def on_resize(self, event: events.Resize) -> None:
+        # Hide the cover column on narrow terminals so tables keep their width.
+        panel = self.query_one("#art-panel", NowPlayingPanel)
+        panel.display = event.size.width >= ART_PANEL_MIN_WIDTH
 
     def shutdown(self) -> None:
         try:
@@ -340,6 +371,7 @@ class YTMusicTUI(App):
         track = self.queue.current
         if track is None:
             self.playing = False
+            self._update_art(None)
             self._sync_bar()
             return
         if not self.mpv.is_running:
@@ -354,7 +386,31 @@ class YTMusicTUI(App):
         self.paused = False
         self.position = 0.0
         self.duration = float(track.duration) if track.duration else None
+        self._update_art(track)
         self._sync_bar()
+
+    # -- album art -----------------------------------------------------------
+    def _update_art(self, track: Track | None) -> None:
+        """Refresh the now-playing panel and kick off a cover fetch."""
+        panel = self.query_one("#art-panel", NowPlayingPanel)
+        panel.show_track(track)
+        self._art_token += 1
+        token = self._art_token
+        if track is None or not track.thumbnail:
+            panel.show_art(None)
+            return
+        self._fetch_art(art_url(track.thumbnail), token)
+
+    @work(thread=True, exclusive=True, group="art", exit_on_error=False)
+    def _fetch_art(self, url: str, token: int) -> None:
+        data = art.fetch(url)
+        rendered = art.render_halfblock(data) if data is not None else None
+        self.call_from_thread(self._art_done, token, rendered)
+
+    def _art_done(self, token: int, rendered: Text | None) -> None:
+        if token != self._art_token:
+            return  # a newer track replaced this fetch
+        self.query_one("#art-panel", NowPlayingPanel).show_art(rendered)
 
     def _advance(self) -> None:
         if self.queue.next() is None:
@@ -815,6 +871,7 @@ class YTMusicTUI(App):
         self.position = None
         self.duration = None
         self._rebuild_results()
+        self._update_art(None)
         if self.mpv.is_running:
             try:
                 self.mpv.command("stop")

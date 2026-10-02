@@ -24,6 +24,7 @@ class Track:
     artists: tuple[str, ...] = ()
     album: str | None = None
     duration: int | None = None  # seconds
+    thumbnail: str | None = None  # largest available cover image URL
 
     @property
     def artist_str(self) -> str:

@@ -10,12 +10,12 @@ from rich.text import Text
 from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import auth
+from . import art, auth
 from .models import Playlist, Track, format_duration
 
 PROGRESS_WIDTH = 24
@@ -381,6 +381,32 @@ class LoginScreen(ModalScreen[bool]):
         if self._code is None:
             return
         webbrowser.open(self._code.url)
+
+
+class NowPlayingPanel(Vertical):
+    """Right-hand dock: album cover rendered in half-blocks + track meta."""
+
+    def compose(self) -> ComposeResult:
+        yield Static(art.placeholder(), id="art-image")
+        yield Static(id="art-meta")
+
+    def show_art(self, rendered: Text | None) -> None:
+        self.query_one("#art-image", Static).update(
+            rendered if rendered is not None else art.placeholder()
+        )
+
+    def show_track(self, track: Track | None) -> None:
+        meta = Text()
+        if track is None:
+            meta.append("No cover", style="dim")
+        else:
+            meta.append(track.title, style="bold")
+            meta.append("\n")
+            meta.append(track.artist_str, style="cyan")
+            if track.duration:
+                meta.append("\n")
+                meta.append(format_duration(track.duration), style="dim")
+        self.query_one("#art-meta", Static).update(meta)
 
 
 class PlaylistPicker(ModalScreen[str | None]):
