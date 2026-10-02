@@ -11,10 +11,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Header, Input, TabbedContent, TabPane
 
-from .models import Track
+from .models import Playlist, Track
 from .mpv_client import MpvClient, MpvError
 from .queue import QueueModel
-from .widgets import HelpScreen, LoginScreen, PlayerBar, hints_for
+from .widgets import HelpScreen, LoginScreen, PlayerBar, PlaylistPicker, hints_for
 from .ytm import YTMusicClient
 
 SEARCH_DEBOUNCE = 0.4
@@ -42,6 +42,17 @@ class TrackTable(DataTable, inherit_bindings=False):
 def _placeholder(table: TrackTable, message: str) -> None:
     """Add a dimmed single-cell status/placeholder row."""
     table.add_row("", Text(message, style="dim"), "", "")
+
+
+def _title_cell(title: str, playing: bool, marked: bool) -> Text | str:
+    """Row title cell: plain string normally, marked/playing prefixes when active."""
+    if playing and marked:
+        return Text(f"▶● {title}", style="bold green")
+    if playing:
+        return Text(f"▶ {title}", style="bold green")
+    if marked:
+        return Text(f"● {title}", style="bold yellow")
+    return title
 
 
 class YTMusicTUI(App):
@@ -103,6 +114,19 @@ class YTMusicTUI(App):
     #login-hints {
         margin-top: 1;
     }
+    #picker-box {
+        width: 64;
+        max-width: 94%;
+        height: auto;
+        max-height: 85%;
+        border: tall $accent;
+        background: $panel;
+        padding: 1 2;
+    }
+    #picker-list {
+        height: auto;
+        max-height: 20;
+    }
     """
 
     BINDINGS = [
@@ -133,6 +157,9 @@ class YTMusicTUI(App):
         Binding("escape", "go_back", "Back", show=False),
         Binding("?", "show_help", "Help", show=False),
         Binding("ctrl+l", "login", "Login", show=False),
+        Binding("s", "toggle_mark", "Mark", show=False),
+        Binding("S", "clear_marks", "Clear marks", show=False),
+        Binding("A", "add_to_playlist", "Add to playlist", show=False),
     ]
 
     def __init__(self) -> None:
@@ -155,7 +182,8 @@ class YTMusicTUI(App):
         self._g_pending = False
         self._g_timer: Any = None
         self._marked: set[str] = set()
-        self._playlists: list[Any] | None = None
+        self._playlists: list[Playlist] | None = None
+        self._pending_add: list[Track] | None = None
 
     # -- composition --------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -302,6 +330,8 @@ class YTMusicTUI(App):
             queue_index=(self.queue.cursor + 1) if self.queue.current else 0,
             queue_length=len(self.queue),
             mode=mode,
+            marked=len(self._marked),
+            authed=self.ytm.authed,
             hints=hints_for(mode, self._active_tab),
         )
 
@@ -366,6 +396,7 @@ class YTMusicTUI(App):
         self._search_token += 1
         token = self._search_token
         self._results = []
+        self._marked.clear()
         table.clear()
         _placeholder(table, f"Searching “{query}”…")
         self._search(query, token)
@@ -401,17 +432,13 @@ class YTMusicTUI(App):
         current = self.queue.current
         for track in self._results:
             playing = current is not None and track.video_id == current.video_id
-            if playing:
-                table.add_row(
-                    Text(f"▶ {track.title}", style="bold green"),
-                    Text(track.artist_str, style="green"),
-                    track.album or "",
-                    track.duration_str,
-                )
-            else:
-                table.add_row(
-                    track.title, track.artist_str, track.album or "", track.duration_str
-                )
+            marked = track.video_id in self._marked
+            table.add_row(
+                _title_cell(track.title, playing, marked),
+                Text(track.artist_str, style="green") if playing else track.artist_str,
+                track.album or "",
+                track.duration_str,
+            )
         if table.row_count:
             table.move_cursor(row=min(max(cursor, 0), table.row_count - 1))
 
@@ -428,15 +455,21 @@ class YTMusicTUI(App):
         table.clear()
         for index, track in enumerate(self.queue.items, start=1):
             is_current = self.queue.current is not None and index - 1 == self.queue.cursor
+            marked = track.video_id in self._marked
             if is_current:
                 table.add_row(
                     Text("▶", style="bold green"),
-                    Text(track.title, style="bold green"),
+                    _title_cell(track.title, playing=True, marked=marked),
                     Text(track.artist_str, style="green"),
                     track.duration_str,
                 )
             else:
-                table.add_row(str(index), track.title, track.artist_str, track.duration_str)
+                table.add_row(
+                    str(index),
+                    _title_cell(track.title, playing=False, marked=marked),
+                    track.artist_str,
+                    track.duration_str,
+                )
         if self.queue.current is not None:
             table.move_cursor(row=self.queue.cursor)
         try:
@@ -633,16 +666,129 @@ class YTMusicTUI(App):
             self.notify(str(exc), severity="error", markup=False)
 
     def action_enqueue(self) -> None:
-        if self.query_one("#tabs", TabbedContent).active != "results":
-            return
-        table = self.query_one("#results-table", TrackTable)
-        row = table.cursor_row
-        if not (0 <= row < len(self._results)):
-            return
-        track = self._results[row]
-        self.queue.enqueue(track)
+        if not self._marked and self._active_tab != "results":
+            return  # `a` on the queue tab only acts on marked songs
+        tracks = self._targets()
+        if not tracks:
+            return  # placeholder / empty rows
+        for track in tracks:
+            self.queue.enqueue(track)
         self._rebuild_queue()
-        self.notify(f"Queued: {track.title}", timeout=3, markup=False)
+        if len(tracks) == 1:
+            self.notify(f"Queued: {tracks[0].title}", timeout=3, markup=False)
+        else:
+            self.notify(f"Queued {len(tracks)} songs", timeout=3, markup=False)
+
+    # -- selection (marks) ---------------------------------------------------
+    def _cursor_track(self) -> Track | None:
+        """Track under the cursor of the active table (None for placeholders)."""
+        table = self._active_table()
+        if table is None:
+            return None
+        row = table.cursor_row
+        if self._active_tab == "queue":
+            return self.queue.items[row] if 0 <= row < len(self.queue) else None
+        return self._results[row] if 0 <= row < len(self._results) else None
+
+    def _marked_tracks(self) -> list[Track]:
+        """Marked tracks in display order (results first), de-duplicated."""
+        if not self._marked:
+            return []
+        seen: set[str] = set()
+        out: list[Track] = []
+        for track in [*self._results, *self.queue.items]:
+            if track.video_id in self._marked and track.video_id not in seen:
+                seen.add(track.video_id)
+                out.append(track)
+        return out
+
+    def _targets(self) -> list[Track]:
+        """Marked songs, falling back to the single song under the cursor."""
+        marked = self._marked_tracks()
+        if marked:
+            return marked
+        cursor_track = self._cursor_track()
+        return [cursor_track] if cursor_track is not None else []
+
+    def action_toggle_mark(self) -> None:
+        track = self._cursor_track()
+        if track is None:
+            return
+        if track.video_id in self._marked:
+            self._marked.discard(track.video_id)
+        else:
+            self._marked.add(track.video_id)
+        if self._active_tab == "queue":
+            self._rebuild_queue()
+        else:
+            self._rebuild_results()
+        self._sync_bar()
+
+    def action_clear_marks(self) -> None:
+        if not self._marked:
+            return
+        self._marked.clear()
+        self._rebuild_results()
+        self._rebuild_queue()
+        self._sync_bar()
+
+    # -- playlist add --------------------------------------------------------
+    def action_add_to_playlist(self) -> None:
+        tracks = self._targets()
+        if not tracks:
+            self.notify("Nothing selected — s marks songs", timeout=4, markup=False)
+            return
+        self._pending_add = tracks
+        self.push_screen(PlaylistPicker(len(tracks)), self._playlist_chosen)
+
+    def _playlist_chosen(self, result: str | None) -> None:
+        tracks = self._pending_add or []
+        self._pending_add = None
+        if result is None or not tracks:
+            return
+        if result == PlaylistPicker.LOGIN:
+            self.action_login()
+            return
+        title = self._playlist_title(result)
+        self._add_to_playlist(result, [t.video_id for t in tracks], title, len(tracks))
+
+    def _playlist_title(self, playlist_id: str) -> str:
+        for playlist in self._playlists or []:
+            if playlist.playlist_id == playlist_id:
+                return playlist.title
+        return playlist_id
+
+    @work(thread=True, exclusive=True, group="add-to-playlist")
+    def _add_to_playlist(
+        self, playlist_id: str, video_ids: list[str], title: str, count: int
+    ) -> None:
+        try:
+            self.ytm.add_to_playlist(playlist_id, video_ids)
+        except Exception as exc:
+            self.call_from_thread(self._add_failed, title, str(exc))
+            return
+        self.call_from_thread(self._add_done, title, count)
+
+    def _add_done(self, title: str, count: int) -> None:
+        self._marked.clear()
+        self._rebuild_results()
+        self._rebuild_queue()
+        noun = "song" if count == 1 else "songs"
+        self.notify(
+            f"Added {count} {noun} → {title}",
+            title="Playlist",
+            timeout=4,
+            markup=False,
+        )
+
+    def _add_failed(self, title: str, error: str) -> None:
+        self.notify(
+            f"Add to “{title}” failed: {error}",
+            title="Playlist",
+            severity="error",
+            timeout=8,
+            markup=False,
+        )
 
     def action_remove(self) -> None:
         if self.query_one("#tabs", TabbedContent).active != "queue":

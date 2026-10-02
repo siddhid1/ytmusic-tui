@@ -7,15 +7,16 @@ import webbrowser
 from typing import Any
 
 from rich.text import Text
-from textual import work
+from textual import on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Input, Static
+from textual.widgets import Input, OptionList, Static
+from textual.widgets.option_list import Option
 
 from . import auth
-from .models import Track, format_duration
+from .models import Playlist, Track, format_duration
 
 PROGRESS_WIDTH = 24
 
@@ -32,10 +33,10 @@ def hints_for(mode: str, tab: str) -> str:
     """Context-sensitive key hints for the hint line."""
     if mode == "insert":
         return "type to search · enter → results · esc → normal"
-    common = "j/k move · gg/G · ctrl+d/u page · space pause · t theme · ? help"
+    common = "j/k · gg/G · ctrl+d/u page · space pause · t theme · ? help"
     if tab == "queue":
-        return "enter jump · d remove · r/q tabs · h/l seek · n/p · " + common
-    return "enter play · a queue · / search · q queue · h/l seek · n/p · " + common
+        return "enter jump · d remove · s mark · A playlist · r/q tabs · n/p · " + common
+    return "enter play · a queue · s mark · A playlist · / search · h/l · n/p · " + common
 
 
 def _truncate(text: str, width: int) -> str:
@@ -62,6 +63,8 @@ class PlayerBar(Static):
         self.queue_index = 0
         self.queue_length = 0
         self.mode = "normal"
+        self.marked = 0
+        self.authed = False
         self.hints = hints_for("normal", "results")
         self.update(self._render_state())
 
@@ -77,6 +80,16 @@ class PlayerBar(Static):
         except Exception:
             return 100
 
+    def _account_chip(self) -> Text:
+        chips = Text()
+        if self.marked:
+            chips.append(f"  ●{self.marked}", style="bold yellow")
+        if self.authed:
+            chips.append("  auth", style="green")
+        else:
+            chips.append("  guest", style="dim")
+        return chips
+
     def _render_state(self) -> Text:
         width = self._terminal_width()
         out = Text()
@@ -90,6 +103,7 @@ class PlayerBar(Static):
             out.append("■ ", style="bold dim")
             out.append("Nothing playing", style="bold dim")
             out.append("  — press / to search", style="dim")
+            out.append(self._account_chip())
         else:
             icon = "⏸" if self.paused else "▶"
             if not self.playing:
@@ -114,11 +128,13 @@ class PlayerBar(Static):
             if self.queue_length:
                 rest.append((f"[{self.queue_index}/{self.queue_length}]", "yellow"))
 
-            used = len(chip) + 7 + sum(len(text) for text, _ in rest)
+            account = self._account_chip()
+            used = len(chip) + 7 + sum(len(text) for text, _ in rest) + len(account)
             title_budget = max(8, width - used)
             out.append(_truncate(self.track.title, title_budget), style="bold")
             for text, style in rest:
                 out.append(text, style=style)
+            out.append(account)
 
         out.append("\n")
         out.append(_truncate(self.hints, width), style="dim")
@@ -143,10 +159,18 @@ HELP_TEXT = """\
   h / l · ← / →        seek -5s / +5s
   + / -                volume up / down
 
+[b]Selection[/b]
+  s                    toggle ● mark on a song
+  S                    clear all marks
+
 [b]Queue[/b]
-  a                    add selected result to queue
+  a                    queue marked songs (or the cursor row)
   d                    remove selected queue entry
   enter                play now / jump to entry
+
+[b]Playlists[/b]
+  A                    add marked songs to a playlist
+  ctrl+l               log in with Google (device code)
 
 [b]Other[/b]
   t                    cycle theme
@@ -357,3 +381,141 @@ class LoginScreen(ModalScreen[bool]):
         if self._code is None:
             return
         webbrowser.open(self._code.url)
+
+
+class PlaylistPicker(ModalScreen[str | None]):
+    """Choose which playlist to add the selected songs to.
+
+    Dismisses with the playlist id, `PlaylistPicker.LOGIN` (guest row), or
+    None on cancel. Loads the user's playlists lazily via a worker.
+    """
+
+    LOGIN = "\x00login"
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("q", "cancel", "Cancel", show=False),
+        Binding("j", "cursor_down", "Down", show=False),
+        Binding("k", "cursor_up", "Up", show=False),
+        Binding("down", "cursor_down", show=False),
+        Binding("up", "cursor_up", show=False),
+        Binding("g", "first", "First", show=False),
+        Binding("G", "last", "Last", show=False),
+    ]
+
+    def __init__(self, count: int) -> None:
+        super().__init__()
+        self.count = count
+        self._playlists: list[Playlist] = []
+        self._state = "loading"  # loading | ready | guest | error
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="picker-box"):
+            yield Static(id="picker-help")
+            yield OptionList(id="picker-list")
+
+    def on_mount(self) -> None:
+        self._show_help(style="bold")
+        self.query_one("#picker-list", OptionList).focus()
+        self._start()
+
+    # -- loading -------------------------------------------------------------
+    def _show_help(self, message: str | None = None, style: str = "bold") -> None:
+        if message is None:
+            plural = "song" if self.count == 1 else "songs"
+            message = f"Add {self.count} {plural} to:"
+        self.query_one("#picker-help", Static).update(Text(message, style=style))
+
+    def _set_options(self, options: list[Option]) -> None:
+        option_list = self.query_one("#picker-list", OptionList)
+        option_list.clear_options()
+        option_list.add_options(options)
+        if option_list.option_count and option_list.highlighted is None:
+            option_list.highlighted = 0
+        option_list.focus()
+
+    def _start(self) -> None:
+        if not self.app.ytm.authed:
+            self._state = "guest"
+            self._show_help("Not logged in — playlists require Google sign-in")
+            self._set_options([Option("Sign in — press enter")])
+            return
+        cached = self.app._playlists
+        if cached is not None:
+            self._show_playlists(cached)
+            return
+        self._state = "loading"
+        self._set_options([Option("Loading playlists…", disabled=True)])
+        self._fetch()
+
+    @work(thread=True, exclusive=True, group="playlists")
+    def _fetch(self) -> None:
+        try:
+            playlists = self.app.ytm.list_playlists()
+        except Exception as exc:  # network / auth errors surface in the picker
+            self.call_from_thread(self._fetch_failed, str(exc))
+            return
+        self.call_from_thread(self._fetch_done, playlists)
+
+    def _fetch_done(self, playlists: list[Playlist]) -> None:
+        if not self.is_attached:
+            return
+        self.app._playlists = playlists
+        self._show_playlists(playlists)
+
+    def _fetch_failed(self, error: str) -> None:
+        if not self.is_attached:
+            return
+        self._state = "error"
+        self._show_help(f"Load failed: {error}  (enter retry · esc cancel)", style="red")
+        self._set_options([Option("Retry loading", disabled=False)])
+
+    def _show_playlists(self, playlists: list[Playlist]) -> None:
+        self._playlists = list(playlists)
+        self._state = "ready"
+        if not playlists:
+            self._show_help("No playlists found — create one in YouTube Music")
+            self._set_options([Option("No playlists", disabled=True)])
+            return
+        self._show_help()
+        options = []
+        for playlist in self._playlists:
+            label = Text(playlist.title)
+            if playlist.count:
+                label.append(f"  ({playlist.count})", style="dim")
+            options.append(Option(label))
+        self._set_options(options)
+
+    # -- selection -----------------------------------------------------------
+    @on(OptionList.OptionSelected)
+    def _option_selected(self, event: OptionList.OptionSelected) -> None:
+        if self._state == "guest":
+            self.dismiss(PlaylistPicker.LOGIN)
+        elif self._state == "error":
+            self._retry()
+        elif self._state == "ready":
+            index = event.index
+            if 0 <= index < len(self._playlists):
+                self.dismiss(self._playlists[index].playlist_id)
+
+    def _retry(self) -> None:
+        self._show_help()
+        self._state = "loading"
+        self._set_options([Option("Loading playlists…", disabled=True)])
+        self._fetch()
+
+    # -- keys ----------------------------------------------------------------
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cursor_down(self) -> None:
+        self.query_one("#picker-list", OptionList).action_cursor_down()
+
+    def action_cursor_up(self) -> None:
+        self.query_one("#picker-list", OptionList).action_cursor_up()
+
+    def action_first(self) -> None:
+        self.query_one("#picker-list", OptionList).action_first()
+
+    def action_last(self) -> None:
+        self.query_one("#picker-list", OptionList).action_last()
