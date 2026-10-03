@@ -767,6 +767,7 @@ class YTMusicTUI(App):
             )
         ]
         if todo:
+            todo.sort(key=lambda s: s != self._lib_section)
             for section in todo:
                 self._lib_state[section] = "loading"
             self._lib_token += 1
@@ -775,7 +776,6 @@ class YTMusicTUI(App):
 
     @work(thread=True, exclusive=True, group="library", exit_on_error=False)
     def _fetch_library(self, sections: list[str], token: int) -> None:
-        fetched: dict[str, tuple[list[Any] | None, str]] = {}
         for section in sections:
             try:
                 if section == "playlists":
@@ -785,22 +785,28 @@ class YTMusicTUI(App):
                 else:
                     items = self.ytm.library_artists()
             except Exception as exc:  # auth / network errors surface in the pane
-                fetched[section] = (None, _friendly_load_error(str(exc)))
+                self.call_from_thread(
+                    self._library_section_loaded,
+                    token,
+                    section,
+                    None,
+                    _friendly_load_error(str(exc)),
+                )
                 continue
-            fetched[section] = (items, "")
-        self.call_from_thread(self._library_loaded, token, fetched)
+            self.call_from_thread(self._library_section_loaded, token, section, items, "")
 
-    def _library_loaded(self, token: int, fetched: dict[str, tuple[list[Any] | None, str]]) -> None:
+    def _library_section_loaded(
+        self, token: int, section: str, items: list[Any] | None, error: str
+    ) -> None:
         if token != self._lib_token:
             return  # a reset (login / staleness) invalidated this fetch
-        for section, (items, error) in fetched.items():
-            if items is None:
-                self._lib_state[section] = "error"
-                self._lib_errors[section] = error
-                self._lib_error_at[section] = time.monotonic()
-            else:
-                self._lib_state[section] = "ready"
-                self._lib_lists[section] = items
+        if items is None:
+            self._lib_state[section] = "error"
+            self._lib_errors[section] = error
+            self._lib_error_at[section] = time.monotonic()
+        else:
+            self._lib_state[section] = "ready"
+            self._lib_lists[section] = items
         self._lib_fetched_at = time.monotonic()
         if self._active_tab == "library":
             self._render_library()
