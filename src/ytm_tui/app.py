@@ -73,6 +73,21 @@ def _placeholder(table: TrackTable, message: str, cells: int = 4) -> None:
     table.add_row(*row)
 
 
+def _friendly_load_error(message: str) -> str:
+    """Collapse an API error to one actionable table-cell line."""
+    text = " ".join(message.split())
+    lowered = text.lower()
+    if (
+        "401" in text
+        or "403" in text
+        or "unauthorized" in lowered
+        or "forbidden" in lowered
+        or "provide authentication" in lowered
+    ):
+        return "Session expired — press ctrl+l to re-paste your browser headers"
+    return text
+
+
 def _title_cell(title: str, playing: bool, marked: bool) -> Text | str:
     """Row title cell: plain string normally, marked/playing prefixes when active."""
     if playing and marked:
@@ -770,7 +785,7 @@ class YTMusicTUI(App):
                 else:
                     items = self.ytm.library_artists()
             except Exception as exc:  # auth / network errors surface in the pane
-                fetched[section] = (None, str(exc))
+                fetched[section] = (None, _friendly_load_error(str(exc)))
                 continue
             fetched[section] = (items, "")
         self.call_from_thread(self._library_loaded, token, fetched)
@@ -884,7 +899,7 @@ class YTMusicTUI(App):
         try:
             tracks = self.ytm.playlist_tracks(playlist_id)
         except Exception as exc:
-            self.call_from_thread(self._playlist_loaded, token, [], str(exc))
+            self.call_from_thread(self._playlist_loaded, token, [], _friendly_load_error(str(exc)))
             return
         self.call_from_thread(self._playlist_loaded, token, tracks, "")
 
@@ -928,7 +943,7 @@ class YTMusicTUI(App):
         try:
             entries = self.ytm.history()
         except Exception as exc:  # auth / network errors surface in the pane
-            self.call_from_thread(self._history_loaded, token, [], str(exc))
+            self.call_from_thread(self._history_loaded, token, [], _friendly_load_error(str(exc)))
             return
         self.call_from_thread(self._history_loaded, token, entries, "")
 
