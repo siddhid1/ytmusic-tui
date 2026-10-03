@@ -17,8 +17,20 @@ without ever leaving the keyboard — a Textual TUI backed by `mpv`.
 - **Multi-select → playlists** — `s` toggles ● marks on songs, `S` clears them,
   and `A` adds all marked songs to one of your saved YouTube Music playlists
   (falls back to the cursor row when nothing is marked)
-- **Two sign-in methods** — optional, unlocks your saved playlists (`A` picker);
-  search and playback work logged-out either way:
+- **Five tabs, keys `1`–`5`** — Results, Queue, Library, History, Profile
+  (`r`/`q` still jump to Results/Queue)
+- **Library browser** — your saved playlists, albums and artists in one pane
+  with section tabs (`tab` / `←`/`→` inside it); `Enter` on a playlist opens
+  its songs — play, queue and mark them like search results, `esc` goes back.
+  Albums and artists are display-only for now.
+- **Play history** — the last 200 plays grouped under shelf labels (Today,
+  Yesterday, This week, …); `Enter` replays any of them (read-only in v1)
+- **Listening profile** — account card with half-block avatar, plus minutes
+  and plays per artist merged from YouTube Music's history *and* a local play
+  tracker (`local_stats.json`, mode 600); guests see local-only stats
+- **Two sign-in methods** — optional, unlocks your library, history and
+  profile (plus the `A` playlist picker); search and playback work logged-out
+  either way:
   * **Browser session** (`ctrl+l` → `ctrl+b`) — paste a *Copy as cURL (bash)*
     command (or raw request headers) copied from a logged-in music.youtube.com
     tab. No Google Cloud setup at all; re-paste whenever the session expires.
@@ -116,12 +128,15 @@ python3 -m venv .venv
 | `d` | Remove selected queue entry |
 | `Enter` (result) | Play now (or jump to it if already queued) |
 | `Enter` (queue) | Jump to / play that queue entry |
+| `Enter` (library) | Open a playlist's songs (`esc` leaves the view) |
+| `Enter` (history) | Play that past track |
 | `/` | Focus search → INSERT mode |
-| `r` / `q` | Results / Queue tab |
+| `r` / `q` | Results / Queue tab (same as `1` / `2`) |
+| `1`–`5` | Results / Queue / Library / History / Profile tab |
 | `Tab` | Cycle focus |
 | `t` | Cycle theme |
 | `?` | Toggle help overlay (`esc`/`q`/`?` closes; `j`/`k` scroll) |
-| `ctrl+l` | Log in (Google device-code OAuth) |
+| `ctrl+l` | Log in (browser session or device-code OAuth) |
 | `ctrl+b` | Inside login: switch to browser-session sign-in |
 | `ctrl+q` | Quit |
 
@@ -135,7 +150,8 @@ python3 -m venv .venv
 
 ## Sign in (optional)
 
-Login unlocks the `A` playlist picker; search and playback work without it.
+Login unlocks the Library, History and Profile tabs (`1`–`5`) plus the `A`
+playlist picker; search and playback work without it.
 Two methods — pick either:
 
 ### Browser session (no Google Cloud needed)
@@ -175,12 +191,15 @@ browser logout, etc.); the app tells you when it is rejected.
 Test coverage: the queue model, track/duration parsing, statusline
 hint/progress helpers, the OAuth config/device-poll loop (mocked),
 browser-header parsing/storage and client-priority selection, multi-select
-mark logic, and album-art URL/thumbnail/half-block rendering — **85 tests**.
+mark logic, album-art URL/thumbnail/half-block rendering, the library /
+history / account adapters, profile aggregation and local-stats storage,
+tab-key dispatch and guest placeholders — **109 tests**.
 The full flow (search → mark `s` → playlist picker → guest login screen →
 login method toggle → queue ops → playback with real album art → resize
-auto-hide → help overlay → `ctrl+l` → theme/seek/volume) is verified
-end-to-end with Textual's headless pilot harness driving a real mpv against
-the `null` audio output (`YT_TUI_MPV_EXTRA="--ao=null"`).
+auto-hide → help overlay → `ctrl+l` → tab keys `1`–`5` with guest
+library/history/profile panes → theme/seek/volume → local play-stats file)
+is verified end-to-end with Textual's headless pilot harness driving a real
+mpv against the `null` audio output (`YT_TUI_MPV_EXTRA="--ao=null"`).
 
 ## Troubleshooting
 
@@ -212,7 +231,6 @@ the `null` audio output (`YT_TUI_MPV_EXTRA="--ao=null"`).
       YT Music's watch playlist (`get_watch_playlist`) — API already validated
 - [ ] **Browse** — drill into albums, artists, and playlists from search results
       (`get_album` / `get_artist` / `get_playlist` all verified working)
-- [ ] **Library tab** — browse saved playlists beyond the `A` picker
 
 ### Then
 - [ ] Shuffle + repeat modes (off / all / one)
@@ -229,6 +247,11 @@ the `null` audio output (`YT_TUI_MPV_EXTRA="--ao=null"`).
 
 ### Known limitations
 - Queue and marks reset on exit (oauth token persists)
+- History is read-only (no removal), and library albums/artists are
+  display-only — only playlists drill into playable songs
+- Library / History / Profile need sign-in; the profile's "recent history"
+  column uses only YouTube's last 200 plays, "This app" only counts listens
+  made while this player was running
 - Narrow terminals (< ~110 cols) hide the cover column and scroll the tables
   horizontally
 - YouTube stream URL 403s are retried but not solved (cookies/PO-token support
