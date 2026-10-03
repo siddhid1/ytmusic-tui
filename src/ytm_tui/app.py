@@ -13,7 +13,7 @@ from textual.binding import Binding
 from textual.widgets import DataTable, Header, Input, Static, Tab, TabbedContent, TabPane, Tabs
 
 from . import art
-from .models import Playlist, Track
+from .models import HistoryEntry, Playlist, Track
 from .mpv_client import MpvClient, MpvError
 from .queue import QueueModel
 from .widgets import (
@@ -258,6 +258,12 @@ class YTMusicTUI(App):
         self._lib_drill_loading = False
         self._lib_drill_error = ""
         self._lib_tracks: list[Track] = []
+        # History tab: read-only list of recent plays.
+        self._history: list[HistoryEntry] = []
+        self._history_state = "unloaded"  # unloaded | loading | ready | error
+        self._history_error = ""
+        self._history_fetched_at: float | None = None
+        self._history_token = 0
 
     # -- composition --------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -446,6 +452,8 @@ class YTMusicTUI(App):
         self._sync_bar()
         if self._active_tab == "library":
             self._ensure_library()
+        elif self._active_tab == "history":
+            self._ensure_history()
 
     def _sync_bar(self) -> None:
         mode = self._mode
@@ -656,6 +664,9 @@ class YTMusicTUI(App):
                 self._load_current()
         elif table_id == "library-table":
             self._library_row_selected(row)
+        elif table_id == "history-table":
+            if 0 <= row < len(self._history):
+                self._play_now(self._history[row].track)
 
     def _play_now(self, track: Track) -> None:
         for index, queued in enumerate(self.queue.items):
@@ -840,6 +851,87 @@ class YTMusicTUI(App):
         self._lib_drill_loading = False
         self._lib_drill_error = ""
         self._lib_tracks = []
+
+    # -- history tab ---------------------------------------------------------
+    def _ensure_history(self) -> None:
+        """Render history; fetch on first visit and refetch when stale."""
+        if (
+            self._history_fetched_at is not None
+            and time.monotonic() - self._history_fetched_at > LIBRARY_STALE_SECONDS
+        ):
+            self._reset_history()
+        if not self.ytm.authed:
+            self._render_history()
+            return
+        if self._history_state == "unloaded":
+            self._history_state = "loading"
+            self._history_token += 1
+            self._fetch_history(self._history_token)
+        self._render_history()
+
+    @work(thread=True, exclusive=True, group="history", exit_on_error=False)
+    def _fetch_history(self, token: int) -> None:
+        try:
+            entries = self.ytm.history()
+        except Exception as exc:  # auth / network errors surface in the pane
+            self.call_from_thread(self._history_loaded, token, [], str(exc))
+            return
+        self.call_from_thread(self._history_loaded, token, entries, "")
+
+    def _history_loaded(self, token: int, entries: list[HistoryEntry], error: str) -> None:
+        if token != self._history_token:
+            return  # a reset (login / staleness) invalidated this fetch
+        self._history_fetched_at = time.monotonic()
+        if error:
+            self._history_state = "error"
+            self._history_error = error
+        else:
+            self._history_state = "ready"
+            self._history = entries
+        if self._active_tab == "history":
+            self._render_history()
+
+    def _reset_history(self) -> None:
+        self._history_token += 1  # any in-flight fetch becomes stale
+        self._history = []
+        self._history_state = "unloaded"
+        self._history_error = ""
+        self._history_fetched_at = None
+
+    def _render_history(self) -> None:
+        self._render_history_rows()
+        self._sync_bar()
+
+    def _render_history_rows(self) -> None:
+        table = self.query_one("#history-table", TrackTable)
+        cursor = table.cursor_row
+        table.clear()
+        if not self.ytm.authed:
+            _placeholder(table, "Sign in (ctrl+l) to see your listening history", cells=5)
+            return
+        if self._history_state == "error":
+            _placeholder(table, f"Load failed: {self._history_error}", cells=5)
+            return
+        if self._history_state != "ready":
+            _placeholder(table, "Loading your listening history…", cells=5)
+            return
+        if not self._history:
+            _placeholder(table, "No listening history yet — play something", cells=5)
+            return
+        current = self.queue.current
+        for entry in self._history:
+            track = entry.track
+            playing = current is not None and track.video_id == current.video_id
+            marked = track.video_id in self._marked
+            table.add_row(
+                entry.played,
+                _title_cell(track.title, playing, marked),
+                Text(track.artist_str, style="green") if playing else track.artist_str,
+                track.album or "",
+                track.duration_str,
+            )
+        if table.row_count:
+            table.move_cursor(row=min(max(cursor, 0), table.row_count - 1))
 
     # -- actions ------------------------------------------------------------
     def _active_table(self) -> TrackTable | None:
@@ -1044,6 +1136,8 @@ class YTMusicTUI(App):
         row = table.cursor_row
         if tab == "queue":
             return self.queue.items[row] if 0 <= row < len(self.queue) else None
+        if tab == "history":
+            return self._history[row].track if 0 <= row < len(self._history) else None
         if tab == "library":
             if self._lib_drill is None:
                 return None  # playlist/album/artist rows are not tracks
@@ -1056,7 +1150,8 @@ class YTMusicTUI(App):
             return []
         seen: set[str] = set()
         out: list[Track] = []
-        for track in [*self._results, *self.queue.items, *self._lib_tracks]:
+        history_tracks = (entry.track for entry in self._history)
+        for track in [*self._results, *self.queue.items, *self._lib_tracks, *history_tracks]:
             if track.video_id in self._marked and track.video_id not in seen:
                 seen.add(track.video_id)
                 out.append(track)
@@ -1087,6 +1182,8 @@ class YTMusicTUI(App):
             self._rebuild_queue()
         elif tab == "library":
             self._render_library()
+        elif tab == "history":
+            self._render_history()
         else:
             self._rebuild_results()
 
@@ -1096,8 +1193,8 @@ class YTMusicTUI(App):
         self._marked.clear()
         self._rebuild_results()
         self._rebuild_queue()
-        if self._active_tab == "library":
-            self._render_library()
+        if self._active_tab in ("library", "history"):
+            self._rebuild_active()
         self._sync_bar()
 
     # -- playlist add --------------------------------------------------------
@@ -1213,6 +1310,7 @@ class YTMusicTUI(App):
         if self.ytm.enable_auth():
             self._playlists = None  # stale guest cache
             self._reset_library()  # guest placeholder → real library data
+            self._reset_history()
             info = self._pending_account
             self._pending_account = None
             if info:

@@ -53,3 +53,20 @@ def test_guest_library_shows_sign_in_hint(tmp_path, monkeypatch):
             assert app.query_one("#tabs").active == "profile"
 
     asyncio.run(scenario())
+
+
+def test_guest_history_shows_sign_in_hint(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("YT_TUI_MPV_EXTRA", "--ao=null")
+
+    async def scenario() -> None:
+        app = YTMusicTUI()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("4")
+            await pilot.pause()
+            assert app.query_one("#tabs").active == "history"
+            row = app.query_one("#history-table").get_row_at(0)
+            assert "Sign in (ctrl+l)" in str(row[1]), f"guest hint missing: {row!r}"
+
+    asyncio.run(scenario())

@@ -69,3 +69,10 @@ class LibraryArtist:
     browse_id: str
     name: str
     detail: str = ""  # subscriber count when YouTube shows one
+
+
+@dataclass(frozen=True, slots=True)
+class HistoryEntry:
+    track: Track
+    played: str = ""  # shelf label: "Today", "Yesterday", "This week", …
+    feedback_token: str = ""  # YouTube's token for removing this entry

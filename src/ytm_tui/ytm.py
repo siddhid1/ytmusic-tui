@@ -10,7 +10,7 @@ from ytmusicapi.auth.oauth import OAuthCredentials
 from ytmusicapi.auth.types import AuthType
 
 from . import auth
-from .models import LibraryAlbum, LibraryArtist, Playlist, Track
+from .models import HistoryEntry, LibraryAlbum, LibraryArtist, Playlist, Track
 
 _MAX_RESULTS = 25
 
@@ -190,6 +190,26 @@ class YTMusicClient:
             if track:
                 tracks.append(track)
         return tracks
+
+    def history(self) -> list[HistoryEntry]:
+        """Play history, newest first (requires login; shelves become `played`)."""
+        with self._lock:
+            raw = self._yt.get_history()
+        entries = []
+        for item in raw or []:
+            if not isinstance(item, dict):
+                continue
+            track = _to_track(item)
+            if not track:
+                continue
+            entries.append(
+                HistoryEntry(
+                    track=track,
+                    played=str(item.get("played") or ""),
+                    feedback_token=str(item.get("feedbackToken") or ""),
+                )
+            )
+        return entries
 
     def add_to_playlist(self, playlist_id: str, video_ids: list[str]) -> None:
         """Append songs to a playlist; raise RuntimeError when YT reports failure."""
