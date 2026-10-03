@@ -40,8 +40,10 @@ def hints_for(mode: str, tab: str, *, library_playlist: bool = False) -> str:
         if library_playlist:
             return "enter play · a queue · s mark · esc back · " + common
         return "enter open playlist · tab sections · 1-5 tabs · " + common
-    if tab in ("history", "profile"):
+    if tab == "history":
         return "enter play · s mark · A playlist · 1-5 tabs · " + common
+    if tab == "profile":
+        return "1-5 tabs · " + common
     return "enter play · a queue · s mark · A playlist · / search · h/l · n/p · " + common
 
 

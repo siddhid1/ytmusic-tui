@@ -211,6 +211,16 @@ class YTMusicClient:
             )
         return entries
 
+    def account_info(self) -> dict[str, str]:
+        """Signed-in account name, handle and avatar URL (requires login)."""
+        with self._lock:
+            raw = self._yt.get_account_info() or {}
+        return {
+            "accountName": str(raw.get("accountName") or ""),
+            "channelHandle": str(raw.get("channelHandle") or ""),
+            "accountPhotoUrl": str(raw.get("accountPhotoUrl") or ""),
+        }
+
     def add_to_playlist(self, playlist_id: str, video_ids: list[str]) -> None:
         """Append songs to a playlist; raise RuntimeError when YT reports failure."""
         if not video_ids:

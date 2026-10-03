@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .auth import _write_private, config_dir
-from .models import Track
+from .models import HistoryEntry, Track
 
 STATS_FILE = "local_stats.json"
 MAX_EVENTS = 2000  # cap so the file stays small and rewrites stay cheap
@@ -123,3 +123,52 @@ def artist_stats(events: list[PlayEvent]) -> list[ArtistStat]:
         ArtistStat(name=name, seconds=round(seconds, 1), plays=plays.get(name, 0))
         for name, seconds in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
     ]
+
+
+@dataclass(frozen=True, slots=True)
+class ProfileRow:
+    """One artist row of the profile table."""
+
+    name: str
+    recent_seconds: float  # from YouTube Music history
+    app_seconds: float  # from this app's local tracker
+    app_plays: int
+
+
+def profile_rows(
+    recent: list[HistoryEntry],
+    local: list[PlayEvent],
+    top: int = 50,
+) -> list[ProfileRow]:
+    """Union of both sources for the profile table, most listened first."""
+    recent_totals: dict[str, float] = {}
+    for entry in recent:
+        seconds = float(entry.track.duration or 0)
+        if seconds <= 0:
+            continue
+        for name in entry.track.artists or ("Unknown artist",):
+            recent_totals[name] = recent_totals.get(name, 0.0) + seconds
+    app = {s.name: (s.seconds, s.plays) for s in artist_stats(local)}
+    rows = []
+    for name in set(recent_totals) | set(app):
+        app_seconds, app_plays = app.get(name, (0.0, 0))
+        rows.append(
+            ProfileRow(
+                name=name,
+                recent_seconds=round(recent_totals.get(name, 0.0), 1),
+                app_seconds=app_seconds,
+                app_plays=app_plays,
+            )
+        )
+    rows.sort(key=lambda r: r.recent_seconds + r.app_seconds, reverse=True)
+    return rows[:top]
+
+
+def profile_summary(
+    recent: list[HistoryEntry], local: list[PlayEvent]
+) -> tuple[float, int, float, int]:
+    """Totals for the profile summary line: (recent_s, recent_plays, app_s, app_plays)."""
+    recent_seconds = sum(float(e.track.duration or 0) for e in recent)
+    app_seconds = sum(e.seconds for e in local)
+    app_plays = sum(1 for e in local if e.seconds >= PLAY_THRESHOLD)
+    return recent_seconds, len(recent), app_seconds, app_plays

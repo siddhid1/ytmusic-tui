@@ -183,6 +183,11 @@ class YTMusicTUI(App):
         height: auto;
         padding: 1 2;
     }
+    #profile-avatar {
+        display: none;
+        height: auto;
+        padding: 0 2;
+    }
     """
 
     BINDINGS = [
@@ -264,6 +269,11 @@ class YTMusicTUI(App):
         self._history_error = ""
         self._history_fetched_at: float | None = None
         self._history_token = 0
+        # Profile tab: account card + merged artist stats.
+        self._account: dict[str, str] | None = None
+        self._account_loading = False
+        self._account_token = 0
+        self._local_events: list[stats.PlayEvent] = []
         # Track whose listening time is accumulating in self.position.
         self._loaded_track: Track | None = None
 
@@ -303,6 +313,7 @@ class YTMusicTUI(App):
                     zebra_stripes=True,
                 )
             with TabPane("Profile", id="profile"):
+                yield Static(id="profile-avatar")
                 yield Static("Listening stats appear here", id="profile-summary")
                 yield TrackTable(
                     id="profile-table",
@@ -342,7 +353,7 @@ class YTMusicTUI(App):
         profile.add_column("Recent", width=16)
         profile.add_column("This app", width=16)
         profile.add_column("Plays", width=8)
-        _placeholder(profile, "Sign in (ctrl+l), then play some songs")
+        _placeholder(profile, "Press 5 to see listening stats")
         self.query_one("#search", Input).focus()
         theme = os.environ.get("YT_TUI_THEME")
         if theme and theme in self.available_themes:
@@ -460,6 +471,8 @@ class YTMusicTUI(App):
             self._ensure_library()
         elif self._active_tab == "history":
             self._ensure_history()
+        elif self._active_tab == "profile":
+            self._ensure_profile()
 
     def _sync_bar(self) -> None:
         mode = self._mode
@@ -914,6 +927,8 @@ class YTMusicTUI(App):
             self._history = entries
         if self._active_tab == "history":
             self._render_history()
+        elif self._active_tab == "profile":
+            self._render_profile()  # Recent column depends on these entries
 
     def _reset_history(self) -> None:
         self._history_token += 1  # any in-flight fetch becomes stale
@@ -956,6 +971,102 @@ class YTMusicTUI(App):
             )
         if table.row_count:
             table.move_cursor(row=min(max(cursor, 0), table.row_count - 1))
+
+    # -- profile tab ---------------------------------------------------------
+    def _ensure_profile(self) -> None:
+        """Render the profile; refresh account/history/local stats on entry."""
+        self._local_events = stats.load_events()
+        if self.ytm.authed:
+            if self._account is None and not self._account_loading:
+                self._account_loading = True
+                self._account_token += 1
+                self._fetch_account(self._account_token)
+            self._ensure_history()  # Recent column and summary come from history
+        self._render_profile()
+
+    @work(thread=True, exclusive=True, group="account", exit_on_error=False)
+    def _fetch_account(self, token: int) -> None:
+        try:
+            info = self.ytm.account_info()
+        except Exception as exc:  # surface as a warning, stats still render
+            self.call_from_thread(self._account_loaded, token, None, str(exc))
+            return
+        self.call_from_thread(self._account_loaded, token, info, "")
+
+    def _account_loaded(self, token: int, info: dict[str, str] | None, error: str) -> None:
+        if token != self._account_token:
+            return  # login reset invalidated this fetch
+        self._account_loading = False
+        self._account = info
+        if info and info.get("accountPhotoUrl"):
+            self._fetch_profile_avatar(info["accountPhotoUrl"])
+        elif error:
+            self.notify(
+                f"Account info unavailable: {error}",
+                title="Profile",
+                severity="warning",
+                timeout=6,
+                markup=False,
+            )
+        if self._active_tab == "profile":
+            self._render_profile()
+
+    @work(thread=True, exclusive=True, group="profile-avatar", exit_on_error=False)
+    def _fetch_profile_avatar(self, url: str) -> None:
+        data = art.fetch(url)
+        rendered = art.render_halfblock(data) if data is not None else None
+        self.call_from_thread(self._profile_avatar_loaded, rendered)
+
+    def _profile_avatar_loaded(self, rendered: Text | None) -> None:
+        avatar = self.query_one("#profile-avatar", Static)
+        if rendered is None:
+            avatar.display = False
+            return
+        avatar.update(rendered)
+        avatar.display = True
+
+    def _render_profile(self) -> None:
+        summary = self.query_one("#profile-summary", Static)
+        recent = self._history if self._history_state == "ready" else []
+        local = self._local_events
+        recent_s, recent_plays, app_s, app_plays = stats.profile_summary(recent, local)
+
+        text = Text()
+        if self.ytm.authed and self._account:
+            name = self._account.get("accountName") or ""
+            handle = self._account.get("channelHandle") or ""
+            if name:
+                text.append(name, style="bold")
+                if handle:
+                    text.append(f"  {handle}", style="dim")
+                text.append("\n")
+        parts = []
+        if recent_plays:
+            parts.append(f"Recent history: {recent_s / 60:.1f} min / {recent_plays} plays")
+        if local:
+            parts.append(f"This app: {app_s / 60:.1f} min / {app_plays} plays")
+        if parts:
+            text.append(" · ".join(parts))
+        else:
+            text.append("No listening data yet — play some songs")
+            if not self.ytm.authed:
+                text.append(" · sign in (ctrl+l) for recent history")
+        summary.update(text)
+
+        table = self.query_one("#profile-table", TrackTable)
+        cursor = table.cursor_row
+        table.clear()
+        rows = stats.profile_rows(recent, local)
+        if not rows:
+            _placeholder(table, "No listening data yet — play some songs")
+        for row in rows:
+            recent_cell = f"{row.recent_seconds / 60:.1f} min" if row.recent_seconds else ""
+            app_cell = f"{row.app_seconds / 60:.1f} min" if row.app_seconds else ""
+            plays_cell = str(row.app_plays) if row.app_plays else ""
+            table.add_row(row.name, recent_cell, app_cell, plays_cell)
+        if table.row_count:
+            table.move_cursor(row=min(max(cursor, 0), table.row_count - 1))
+        self._sync_bar()
 
     # -- actions ------------------------------------------------------------
     def _active_table(self) -> TrackTable | None:
@@ -1336,6 +1447,10 @@ class YTMusicTUI(App):
             self._playlists = None  # stale guest cache
             self._reset_library()  # guest placeholder → real library data
             self._reset_history()
+            self._account = None  # refetch account card for the new session
+            self._account_loading = False
+            self._account_token += 1  # any in-flight account fetch is stale
+            self.query_one("#profile-avatar", Static).display = False
             info = self._pending_account
             self._pending_account = None
             if info:

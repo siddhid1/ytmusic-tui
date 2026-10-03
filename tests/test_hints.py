@@ -47,6 +47,9 @@ class TestHintsFor:
             assert "1-5 tabs" in hints
             assert "? help" in hints
 
+    def test_profile_hints_do_not_advertise_play(self):
+        assert "enter play" not in hints_for("normal", "profile")
+
 
 class TestProgressBar:
     def test_empty_when_no_duration(self):
