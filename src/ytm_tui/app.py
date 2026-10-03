@@ -12,7 +12,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import DataTable, Header, Input, Static, Tab, TabbedContent, TabPane, Tabs
 
-from . import art
+from . import art, stats
 from .models import HistoryEntry, Playlist, Track
 from .mpv_client import MpvClient, MpvError
 from .queue import QueueModel
@@ -264,6 +264,8 @@ class YTMusicTUI(App):
         self._history_error = ""
         self._history_fetched_at: float | None = None
         self._history_token = 0
+        # Track whose listening time is accumulating in self.position.
+        self._loaded_track: Track | None = None
 
     # -- composition --------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -357,6 +359,10 @@ class YTMusicTUI(App):
         panel.display = event.size.width >= ART_PANEL_MIN_WIDTH
 
     def shutdown(self) -> None:
+        try:
+            self._flush_play_stats()
+        except Exception:
+            pass
         try:
             self.mpv.close()
         except Exception:
@@ -477,7 +483,23 @@ class YTMusicTUI(App):
             ),
         )
 
+    def _flush_play_stats(self) -> None:
+        """Persist listening time for the track that just stopped (best-effort).
+
+        Called before the position counter is reset or cleared; seconds are
+        approximated by the last reported playback position.
+        """
+        track = self._loaded_track
+        self._loaded_track = None
+        if track is None:
+            return
+        try:
+            stats.record(track, float(self.position or 0.0))
+        except Exception:
+            pass  # statistics must never interrupt playback
+
     def _load_current(self) -> None:
+        self._flush_play_stats()  # previous track's listen ends here
         self._rebuild_results()
         track = self.queue.current
         if track is None:
@@ -497,6 +519,7 @@ class YTMusicTUI(App):
         self.paused = False
         self.position = 0.0
         self.duration = float(track.duration) if track.duration else None
+        self._loaded_track = track
         self._update_art(track)
         self._sync_bar()
 
@@ -525,6 +548,7 @@ class YTMusicTUI(App):
 
     def _advance(self) -> None:
         if self.queue.next() is None:
+            self._flush_play_stats()  # last track finished (position ≈ duration)
             self.playing = False
             self.paused = False
             self.position = None
@@ -1275,6 +1299,7 @@ class YTMusicTUI(App):
         self.notify(f"Removed: {removed.title}", timeout=3, markup=False)
 
     def _stop_playback(self) -> None:
+        self._flush_play_stats()  # position still holds the stopped track's time
         self.playing = False
         self.paused = False
         self.position = None
