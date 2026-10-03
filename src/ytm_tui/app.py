@@ -33,6 +33,7 @@ G_PREFIX_TIMEOUT = 1.0
 ART_PANEL_MIN_WIDTH = 110
 LIBRARY_SECTIONS = ("playlists", "albums", "artists")
 LIBRARY_STALE_SECONDS = 300.0
+LIBRARY_ERROR_RETRY_SECONDS = 30.0
 
 # Main tab id → table that receives cursor/marks while that tab is active.
 _TAB_TABLE = {
@@ -256,6 +257,7 @@ class YTMusicTUI(App):
         self._lib_lists: dict[str, list[Any]] = {s: [] for s in LIBRARY_SECTIONS}
         self._lib_state: dict[str, str] = {s: "unloaded" for s in LIBRARY_SECTIONS}
         self._lib_errors: dict[str, str] = {s: "" for s in LIBRARY_SECTIONS}
+        self._lib_error_at: dict[str, float] = {s: 0.0 for s in LIBRARY_SECTIONS}
         self._lib_fetched_at: float | None = None
         self._lib_token = 0
         self._lib_section = "playlists"
@@ -267,6 +269,7 @@ class YTMusicTUI(App):
         self._history: list[HistoryEntry] = []
         self._history_state = "unloaded"  # unloaded | loading | ready | error
         self._history_error = ""
+        self._history_error_at = 0.0
         self._history_fetched_at: float | None = None
         self._history_token = 0
         # Profile tab: account card + merged artist stats.
@@ -738,7 +741,16 @@ class YTMusicTUI(App):
         if not self.ytm.authed:
             self._render_library()
             return
-        todo = [s for s in LIBRARY_SECTIONS if self._lib_state[s] == "unloaded"]
+        now = time.monotonic()
+        todo = [
+            s
+            for s in LIBRARY_SECTIONS
+            if self._lib_state[s] == "unloaded"
+            or (
+                self._lib_state[s] == "error"
+                and now - self._lib_error_at[s] >= LIBRARY_ERROR_RETRY_SECONDS
+            )
+        ]
         if todo:
             for section in todo:
                 self._lib_state[section] = "loading"
@@ -770,6 +782,7 @@ class YTMusicTUI(App):
             if items is None:
                 self._lib_state[section] = "error"
                 self._lib_errors[section] = error
+                self._lib_error_at[section] = time.monotonic()
             else:
                 self._lib_state[section] = "ready"
                 self._lib_lists[section] = items
@@ -784,6 +797,7 @@ class YTMusicTUI(App):
             self._lib_state[section] = "unloaded"
             self._lib_lists[section] = []
             self._lib_errors[section] = ""
+            self._lib_error_at[section] = 0.0
         self._lib_fetched_at = None
 
     def _render_library(self) -> None:
@@ -900,7 +914,10 @@ class YTMusicTUI(App):
         if not self.ytm.authed:
             self._render_history()
             return
-        if self._history_state == "unloaded":
+        if self._history_state == "unloaded" or (
+            self._history_state == "error"
+            and time.monotonic() - self._history_error_at >= LIBRARY_ERROR_RETRY_SECONDS
+        ):
             self._history_state = "loading"
             self._history_token += 1
             self._fetch_history(self._history_token)
@@ -922,6 +939,7 @@ class YTMusicTUI(App):
         if error:
             self._history_state = "error"
             self._history_error = error
+            self._history_error_at = time.monotonic()
         else:
             self._history_state = "ready"
             self._history = entries
@@ -935,6 +953,7 @@ class YTMusicTUI(App):
         self._history = []
         self._history_state = "unloaded"
         self._history_error = ""
+        self._history_error_at = 0.0
         self._history_fetched_at = None
 
     def _render_history(self) -> None:
