@@ -30,6 +30,23 @@ class TestHintsFor:
     def test_queue_hints_do_not_advertise_play(self):
         assert "enter play" not in hints_for("normal", "queue")
 
+    def test_library_list_hints(self):
+        hints = hints_for("normal", "library")
+        assert "enter open playlist" in hints
+        assert "tab sections" in hints
+        assert "? help" in hints
+
+    def test_library_drill_hints(self):
+        hints = hints_for("normal", "library", library_playlist=True)
+        assert "enter play" in hints
+        assert "esc back" in hints
+
+    def test_history_and_profile_hints(self):
+        for tab in ("history", "profile"):
+            hints = hints_for("normal", tab)
+            assert "1-5 tabs" in hints
+            assert "? help" in hints
+
 
 class TestProgressBar:
     def test_empty_when_no_duration(self):

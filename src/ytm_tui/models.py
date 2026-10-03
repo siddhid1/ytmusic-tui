@@ -54,3 +54,18 @@ class Playlist:
     playlist_id: str
     title: str
     count: str | None = None  # ytmusicapi returns counts as strings ("5")
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryAlbum:
+    browse_id: str
+    title: str
+    artist: str = ""
+    year: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryArtist:
+    browse_id: str
+    name: str
+    detail: str = ""  # subscriber count when YouTube shows one

@@ -10,7 +10,7 @@ from ytmusicapi.auth.oauth import OAuthCredentials
 from ytmusicapi.auth.types import AuthType
 
 from . import auth
-from .models import Playlist, Track
+from .models import LibraryAlbum, LibraryArtist, Playlist, Track
 
 _MAX_RESULTS = 25
 
@@ -136,6 +136,60 @@ class YTMusicClient:
                     )
                 )
         return playlists
+
+    def library_albums(self, limit: int | None = None) -> list[LibraryAlbum]:
+        """Saved albums from the library (requires login; limit=None retrieves all)."""
+        with self._lock:
+            raw = self._yt.get_library_albums(limit=limit)
+        albums = []
+        for item in raw or []:
+            browse_id = item.get("browseId")
+            title = item.get("title")
+            if not browse_id or not title:
+                continue
+            artists = [a.get("name", "") for a in item.get("artists") or [] if isinstance(a, dict)]
+            year = item.get("year")
+            albums.append(
+                LibraryAlbum(
+                    browse_id=str(browse_id),
+                    title=str(title),
+                    artist=", ".join(name for name in artists if name),
+                    year=str(year) if year else "",
+                )
+            )
+        return albums
+
+    def library_artists(self, limit: int | None = None) -> list[LibraryArtist]:
+        """Saved artists from the library (requires login; limit=None retrieves all)."""
+        with self._lock:
+            raw = self._yt.get_library_artists(limit=limit)
+        artists = []
+        for item in raw or []:
+            browse_id = item.get("browseId")
+            name = item.get("artist")
+            if not browse_id or not name:
+                continue
+            artists.append(
+                LibraryArtist(
+                    browse_id=str(browse_id),
+                    name=str(name),
+                    detail=str(item.get("subscribers") or ""),
+                )
+            )
+        return artists
+
+    def playlist_tracks(self, playlist_id: str, limit: int | None = None) -> list[Track]:
+        """Songs of one playlist (login required for private playlists)."""
+        with self._lock:
+            raw = self._yt.get_playlist(playlist_id, limit=limit)
+        tracks = []
+        for item in (raw or {}).get("tracks") or []:
+            if not isinstance(item, dict):
+                continue
+            track = _to_track(item)
+            if track:
+                tracks.append(track)
+        return tracks
 
     def add_to_playlist(self, playlist_id: str, video_ids: list[str]) -> None:
         """Append songs to a playlist; raise RuntimeError when YT reports failure."""

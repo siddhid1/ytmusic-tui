@@ -29,13 +29,19 @@ def _progress_bar(position: float | None, duration: float | None) -> str:
     return "█" * filled + "░" * (PROGRESS_WIDTH - filled)
 
 
-def hints_for(mode: str, tab: str) -> str:
+def hints_for(mode: str, tab: str, *, library_playlist: bool = False) -> str:
     """Context-sensitive key hints for the hint line."""
     if mode == "insert":
         return "type to search · enter → results · esc → normal"
     common = "j/k · gg/G · ctrl+d/u page · space pause · t theme · ? help"
     if tab == "queue":
         return "enter jump · d remove · s mark · A playlist · r/q tabs · n/p · " + common
+    if tab == "library":
+        if library_playlist:
+            return "enter play · a queue · s mark · esc back · " + common
+        return "enter open playlist · tab sections · 1-5 tabs · " + common
+    if tab in ("history", "profile"):
+        return "enter play · s mark · A playlist · 1-5 tabs · " + common
     return "enter play · a queue · s mark · A playlist · / search · h/l · n/p · " + common
 
 
@@ -149,8 +155,9 @@ HELP_TEXT = """\
   ctrl+u / ctrl+b      half / full page up
   /                    focus search (INSERT mode)
   esc                  back to NORMAL mode
-  r                    Results tab
-  q                    Queue tab
+  r / 1                Results tab
+  q / 2                Queue tab
+  3 / 4 / 5            Library / History / Profile tabs
   tab                  cycle focus
 
 [b]Playback[/b]

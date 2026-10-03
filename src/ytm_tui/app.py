@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import DataTable, Header, Input, TabbedContent, TabPane
+from textual.widgets import DataTable, Header, Input, Static, Tab, TabbedContent, TabPane, Tabs
 
 from . import art
 from .models import Playlist, Track
@@ -30,6 +31,22 @@ SEEK_STEP = 5.0
 VOLUME_STEP = 5
 G_PREFIX_TIMEOUT = 1.0
 ART_PANEL_MIN_WIDTH = 110
+LIBRARY_SECTIONS = ("playlists", "albums", "artists")
+LIBRARY_STALE_SECONDS = 300.0
+
+# Main tab id → table that receives cursor/marks while that tab is active.
+_TAB_TABLE = {
+    "results": "#results-table",
+    "queue": "#queue-table",
+    "library": "#library-table",
+    "history": "#history-table",
+    "profile": "#profile-table",
+}
+_SECTION_TABS = {
+    "lib-playlists": "playlists",
+    "lib-albums": "albums",
+    "lib-artists": "artists",
+}
 
 
 class TrackTable(DataTable, inherit_bindings=False):
@@ -48,9 +65,11 @@ class TrackTable(DataTable, inherit_bindings=False):
     ]
 
 
-def _placeholder(table: TrackTable, message: str) -> None:
+def _placeholder(table: TrackTable, message: str, cells: int = 4) -> None:
     """Add a dimmed single-cell status/placeholder row."""
-    table.add_row("", Text(message, style="dim"), "", "")
+    row: list[Any] = [""] * cells
+    row[1 if cells > 1 else 0] = Text(message, style="dim")
+    table.add_row(*row)
 
 
 def _title_cell(title: str, playing: bool, marked: bool) -> Text | str:
@@ -154,12 +173,27 @@ class YTMusicTUI(App):
         width: 100%;
         margin-top: 1;
     }
+    #lib-tabs {
+        height: auto;
+    }
+    #library-table, #history-table, #profile-table {
+        height: 1fr;
+    }
+    #profile-summary {
+        height: auto;
+        padding: 1 2;
+    }
     """
 
     BINDINGS = [
         Binding("/", "focus_search", "Search", show=False),
         Binding("r", "show_results", "Results", show=False),
         Binding("q", "show_queue", "Queue", show=False),
+        Binding("1", "show_tab('results')", "Results", show=False),
+        Binding("2", "show_tab('queue')", "Queue", show=False),
+        Binding("3", "show_tab('library')", "Library", show=False),
+        Binding("4", "show_tab('history')", "History", show=False),
+        Binding("5", "show_tab('profile')", "Profile", show=False),
         Binding("space", "toggle_pause", "Play/Pause", show=False),
         Binding("n", "next_track", "Next", show=False),
         Binding("p", "prev_track", "Prev", show=False),
@@ -213,6 +247,17 @@ class YTMusicTUI(App):
         self._playlists: list[Playlist] | None = None
         self._pending_add: list[Track] | None = None
         self._art_token = 0
+        # Library tab: cached section lists, per-section load state, drill-down.
+        self._lib_lists: dict[str, list[Any]] = {s: [] for s in LIBRARY_SECTIONS}
+        self._lib_state: dict[str, str] = {s: "unloaded" for s in LIBRARY_SECTIONS}
+        self._lib_errors: dict[str, str] = {s: "" for s in LIBRARY_SECTIONS}
+        self._lib_fetched_at: float | None = None
+        self._lib_token = 0
+        self._lib_section = "playlists"
+        self._lib_drill: Playlist | None = None
+        self._lib_drill_loading = False
+        self._lib_drill_error = ""
+        self._lib_tracks: list[Track] = []
 
     # -- composition --------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -231,6 +276,31 @@ class YTMusicTUI(App):
                     cursor_type="row",
                     zebra_stripes=True,
                 )
+            with TabPane("Library", id="library"):
+                yield Tabs(
+                    Tab("Playlists", id="lib-playlists"),
+                    Tab("Albums", id="lib-albums"),
+                    Tab("Artists", id="lib-artists"),
+                    id="lib-tabs",
+                )
+                yield TrackTable(
+                    id="library-table",
+                    cursor_type="row",
+                    zebra_stripes=True,
+                )
+            with TabPane("History", id="history"):
+                yield TrackTable(
+                    id="history-table",
+                    cursor_type="row",
+                    zebra_stripes=True,
+                )
+            with TabPane("Profile", id="profile"):
+                yield Static("Listening stats appear here", id="profile-summary")
+                yield TrackTable(
+                    id="profile-table",
+                    cursor_type="row",
+                    zebra_stripes=True,
+                )
         yield NowPlayingPanel(id="art-panel")
         yield PlayerBar(id="player-bar")
 
@@ -246,6 +316,25 @@ class YTMusicTUI(App):
         queue.add_column("Title", width=50)
         queue.add_column("Artist", width=46)
         queue.add_column("Dur", width=6)
+        library = self.query_one("#library-table", TrackTable)
+        library.add_column("Title", width=42)
+        library.add_column("Artist", width=38)
+        library.add_column("Album", width=22)
+        library.add_column("Dur", width=6)
+        _placeholder(library, "Press 3 to open your library")
+        history = self.query_one("#history-table", TrackTable)
+        history.add_column("When", width=10)
+        history.add_column("Title", width=40)
+        history.add_column("Artist", width=36)
+        history.add_column("Album", width=18)
+        history.add_column("Dur", width=6)
+        _placeholder(history, "History loads after sign-in", cells=5)
+        profile = self.query_one("#profile-table", TrackTable)
+        profile.add_column("Artist", width=44)
+        profile.add_column("Recent", width=16)
+        profile.add_column("This app", width=16)
+        profile.add_column("Plays", width=8)
+        _placeholder(profile, "Sign in (ctrl+l), then play some songs")
         self.query_one("#search", Input).focus()
         theme = os.environ.get("YT_TUI_THEME")
         if theme and theme in self.available_themes:
@@ -355,6 +444,8 @@ class YTMusicTUI(App):
     @on(TabbedContent.TabActivated)
     def _on_tab_activated(self) -> None:
         self._sync_bar()
+        if self._active_tab == "library":
+            self._ensure_library()
 
     def _sync_bar(self) -> None:
         mode = self._mode
@@ -371,7 +462,11 @@ class YTMusicTUI(App):
             mode=mode,
             marked=len(self._marked),
             authed=self.ytm.authed,
-            hints=hints_for(mode, self._active_tab),
+            hints=hints_for(
+                mode,
+                self._active_tab,
+                library_playlist=self._active_tab == "library" and self._lib_drill is not None,
+            ),
         )
 
     def _load_current(self) -> None:
@@ -486,15 +581,10 @@ class YTMusicTUI(App):
         self._rebuild_results()
         table.move_cursor(row=0)
 
-    def _rebuild_results(self) -> None:
-        """Re-render result rows, marking the playing track with ▶."""
-        if not self._results:
-            return
-        table = self.query_one("#results-table", TrackTable)
-        cursor = table.cursor_row
-        table.clear()
+    def _add_track_rows(self, table: TrackTable, tracks: list[Track]) -> None:
+        """Append track rows, marking playing/marked songs (▶ / ● prefixes)."""
         current = self.queue.current
-        for track in self._results:
+        for track in tracks:
             playing = current is not None and track.video_id == current.video_id
             marked = track.video_id in self._marked
             table.add_row(
@@ -503,6 +593,15 @@ class YTMusicTUI(App):
                 track.album or "",
                 track.duration_str,
             )
+
+    def _rebuild_results(self) -> None:
+        """Re-render result rows, marking the playing track with ▶."""
+        if not self._results:
+            return
+        table = self.query_one("#results-table", TrackTable)
+        cursor = table.cursor_row
+        table.clear()
+        self._add_track_rows(table, self._results)
         if table.row_count:
             table.move_cursor(row=min(max(cursor, 0), table.row_count - 1))
 
@@ -555,6 +654,8 @@ class YTMusicTUI(App):
                 self.queue.select(row)
                 self._rebuild_queue()
                 self._load_current()
+        elif table_id == "library-table":
+            self._library_row_selected(row)
 
     def _play_now(self, track: Track) -> None:
         for index, queued in enumerate(self.queue.items):
@@ -566,24 +667,204 @@ class YTMusicTUI(App):
         self._rebuild_queue()
         self._load_current()
 
+    # -- library tab ---------------------------------------------------------
+    @on(Tabs.TabActivated, "#lib-tabs")
+    def _on_library_section(self, event: Tabs.TabActivated) -> None:
+        section = _SECTION_TABS.get(event.tab.id or "", "playlists")
+        self._lib_section = section
+        if self._active_tab != "library":
+            return  # mount-time activation; fetch waits for the first visit
+        self._close_library_drill()
+        self._ensure_library()
+        table = self.query_one("#library-table", TrackTable)
+        if table.row_count:
+            table.move_cursor(row=0)
+
+    def _ensure_library(self) -> None:
+        """Render the active section; (re)fetch when unloaded or stale."""
+        if (
+            self._lib_fetched_at is not None
+            and time.monotonic() - self._lib_fetched_at > LIBRARY_STALE_SECONDS
+        ):
+            self._reset_library()
+        if not self.ytm.authed:
+            self._render_library()
+            return
+        todo = [s for s in LIBRARY_SECTIONS if self._lib_state[s] == "unloaded"]
+        if todo:
+            for section in todo:
+                self._lib_state[section] = "loading"
+            self._lib_token += 1
+            self._fetch_library(todo, self._lib_token)
+        self._render_library()
+
+    @work(thread=True, exclusive=True, group="library", exit_on_error=False)
+    def _fetch_library(self, sections: list[str], token: int) -> None:
+        fetched: dict[str, tuple[list[Any] | None, str]] = {}
+        for section in sections:
+            try:
+                if section == "playlists":
+                    items: Any = self.ytm.list_playlists()
+                elif section == "albums":
+                    items = self.ytm.library_albums()
+                else:
+                    items = self.ytm.library_artists()
+            except Exception as exc:  # auth / network errors surface in the pane
+                fetched[section] = (None, str(exc))
+                continue
+            fetched[section] = (items, "")
+        self.call_from_thread(self._library_loaded, token, fetched)
+
+    def _library_loaded(self, token: int, fetched: dict[str, tuple[list[Any] | None, str]]) -> None:
+        if token != self._lib_token:
+            return  # a reset (login / staleness) invalidated this fetch
+        for section, (items, error) in fetched.items():
+            if items is None:
+                self._lib_state[section] = "error"
+                self._lib_errors[section] = error
+            else:
+                self._lib_state[section] = "ready"
+                self._lib_lists[section] = items
+        self._lib_fetched_at = time.monotonic()
+        if self._active_tab == "library":
+            self._render_library()
+
+    def _reset_library(self) -> None:
+        """Drop cached library data (after login or when data goes stale)."""
+        self._lib_token += 1  # any in-flight fetch becomes stale
+        for section in LIBRARY_SECTIONS:
+            self._lib_state[section] = "unloaded"
+            self._lib_lists[section] = []
+            self._lib_errors[section] = ""
+        self._lib_fetched_at = None
+
+    def _render_library(self) -> None:
+        self._render_library_rows()
+        # Drill in/out never moves focus, so refresh hints explicitly.
+        self._sync_bar()
+
+    def _render_library_rows(self) -> None:
+        table = self.query_one("#library-table", TrackTable)
+        cursor = table.cursor_row
+        table.clear()
+        if self._lib_drill is not None:
+            self._render_library_drill(table)
+            return
+        section = self._lib_section
+        if not self.ytm.authed:
+            _placeholder(table, "Sign in (ctrl+l) to browse your library")
+            return
+        if self._lib_state[section] == "error":
+            _placeholder(table, f"Load failed: {self._lib_errors[section]}")
+            return
+        if self._lib_state[section] != "ready":
+            _placeholder(table, "Loading your library…")
+            return
+        items = self._lib_lists[section]
+        if not items:
+            _placeholder(table, f"No saved {section} yet — save some in YouTube Music")
+            return
+        if section == "playlists":
+            for playlist in items:
+                count = f"{playlist.count} songs" if playlist.count else ""
+                table.add_row(playlist.title, "", count, "")
+        elif section == "albums":
+            for album in items:
+                table.add_row(album.title, album.artist, album.year, "")
+        else:
+            for artist in items:
+                table.add_row(artist.name, artist.detail, "", "")
+        if table.row_count:
+            table.move_cursor(row=min(max(cursor, 0), table.row_count - 1))
+
+    def _render_library_drill(self, table: TrackTable) -> None:
+        if self._lib_drill_error:
+            _placeholder(table, f"Load failed: {self._lib_drill_error}")
+            return
+        if self._lib_drill_loading:
+            _placeholder(table, f"Loading “{self._lib_drill.title}”…")
+            return
+        if not self._lib_tracks:
+            _placeholder(table, "Playlist is empty")
+            return
+        self._add_track_rows(table, self._lib_tracks)
+        if table.row_count:
+            table.move_cursor(row=0)
+
+    def _library_row_selected(self, row: int) -> None:
+        if self._lib_drill is not None:
+            if 0 <= row < len(self._lib_tracks):
+                self._play_now(self._lib_tracks[row])
+            return
+        if self._lib_section != "playlists":
+            self.notify(
+                "Album and artist detail is not in this version yet",
+                title="Library",
+                timeout=4,
+                markup=False,
+            )
+            return
+        playlists = self._lib_lists["playlists"]
+        if 0 <= row < len(playlists):
+            self._open_library_playlist(playlists[row])
+
+    def _open_library_playlist(self, playlist: Playlist) -> None:
+        self._lib_drill = playlist
+        self._lib_tracks = []
+        self._lib_drill_loading = True
+        self._lib_drill_error = ""
+        self._lib_token += 1  # a section refresh would invalidate this drill
+        self._render_library()
+        self._fetch_playlist(playlist.playlist_id, self._lib_token)
+
+    @work(thread=True, exclusive=True, group="library-drill", exit_on_error=False)
+    def _fetch_playlist(self, playlist_id: str, token: int) -> None:
+        try:
+            tracks = self.ytm.playlist_tracks(playlist_id)
+        except Exception as exc:
+            self.call_from_thread(self._playlist_loaded, token, [], str(exc))
+            return
+        self.call_from_thread(self._playlist_loaded, token, tracks, "")
+
+    def _playlist_loaded(self, token: int, tracks: list[Track], error: str) -> None:
+        if token != self._lib_token:
+            return
+        self._lib_drill_loading = False
+        self._lib_drill_error = error
+        self._lib_tracks = tracks
+        if self._active_tab == "library":
+            self._render_library()
+
+    def _close_library_drill(self) -> None:
+        self._lib_drill = None
+        self._lib_drill_loading = False
+        self._lib_drill_error = ""
+        self._lib_tracks = []
+
     # -- actions ------------------------------------------------------------
     def _active_table(self) -> TrackTable | None:
         """Table of the active tab (none while typing in the search input)."""
         if isinstance(self.focused, Input):
             return None
-        tid = "#queue-table" if self._active_tab == "queue" else "#results-table"
-        return self.query_one(tid, TrackTable)
+        table_id = _TAB_TABLE.get(self._active_tab)
+        if table_id is None:
+            return None
+        return self.query_one(table_id, TrackTable)
 
     def action_focus_search(self) -> None:
         self.query_one("#search", Input).focus()
 
+    def action_show_tab(self, tab_id: str) -> None:
+        if tab_id not in _TAB_TABLE:
+            return
+        self.query_one("#tabs", TabbedContent).active = tab_id
+        self.query_one(_TAB_TABLE[tab_id], TrackTable).focus()
+
     def action_show_results(self) -> None:
-        self.query_one("#tabs", TabbedContent).active = "results"
-        self.query_one("#results-table", TrackTable).focus()
+        self.action_show_tab("results")
 
     def action_show_queue(self) -> None:
-        self.query_one("#tabs", TabbedContent).active = "queue"
-        self.query_one("#queue-table", TrackTable).focus()
+        self.action_show_tab("queue")
 
     # -- vim navigation ------------------------------------------------------
     def action_cursor_down(self) -> None:
@@ -662,6 +943,14 @@ class YTMusicTUI(App):
         if isinstance(self.focused, Input):
             self.query_one("#tabs", TabbedContent).active = "results"
             self.query_one("#results-table", TrackTable).focus()
+            return
+        if self._active_tab == "library" and self._lib_drill is not None:
+            self._close_library_drill()
+            self._render_library()
+            table = self.query_one("#library-table", TrackTable)
+            table.focus()
+            if table.row_count:
+                table.move_cursor(row=0)
 
     def action_toggle_pause(self) -> None:
         if self.queue.current is None:
@@ -730,7 +1019,7 @@ class YTMusicTUI(App):
             self.notify(str(exc), severity="error", markup=False)
 
     def action_enqueue(self) -> None:
-        if not self._marked and self._active_tab != "results":
+        if not self._marked and self._active_tab == "queue":
             return  # `a` on the queue tab only acts on marked songs
         tracks = self._targets()
         if not tracks:
@@ -749,9 +1038,16 @@ class YTMusicTUI(App):
         table = self._active_table()
         if table is None:
             return None
+        tab = self._active_tab
+        if tab == "profile":
+            return None  # stats rows are not playable tracks
         row = table.cursor_row
-        if self._active_tab == "queue":
+        if tab == "queue":
             return self.queue.items[row] if 0 <= row < len(self.queue) else None
+        if tab == "library":
+            if self._lib_drill is None:
+                return None  # playlist/album/artist rows are not tracks
+            return self._lib_tracks[row] if 0 <= row < len(self._lib_tracks) else None
         return self._results[row] if 0 <= row < len(self._results) else None
 
     def _marked_tracks(self) -> list[Track]:
@@ -760,7 +1056,7 @@ class YTMusicTUI(App):
             return []
         seen: set[str] = set()
         out: list[Track] = []
-        for track in [*self._results, *self.queue.items]:
+        for track in [*self._results, *self.queue.items, *self._lib_tracks]:
             if track.video_id in self._marked and track.video_id not in seen:
                 seen.add(track.video_id)
                 out.append(track)
@@ -782,11 +1078,17 @@ class YTMusicTUI(App):
             self._marked.discard(track.video_id)
         else:
             self._marked.add(track.video_id)
-        if self._active_tab == "queue":
+        self._rebuild_active()
+        self._sync_bar()
+
+    def _rebuild_active(self) -> None:
+        tab = self._active_tab
+        if tab == "queue":
             self._rebuild_queue()
+        elif tab == "library":
+            self._render_library()
         else:
             self._rebuild_results()
-        self._sync_bar()
 
     def action_clear_marks(self) -> None:
         if not self._marked:
@@ -794,6 +1096,8 @@ class YTMusicTUI(App):
         self._marked.clear()
         self._rebuild_results()
         self._rebuild_queue()
+        if self._active_tab == "library":
+            self._render_library()
         self._sync_bar()
 
     # -- playlist add --------------------------------------------------------
@@ -908,6 +1212,7 @@ class YTMusicTUI(App):
             return
         if self.ytm.enable_auth():
             self._playlists = None  # stale guest cache
+            self._reset_library()  # guest placeholder → real library data
             info = self._pending_account
             self._pending_account = None
             if info:
