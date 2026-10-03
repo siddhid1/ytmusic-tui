@@ -70,3 +70,31 @@ def test_guest_history_shows_sign_in_hint(tmp_path, monkeypatch):
             assert "Sign in (ctrl+l)" in str(row[1]), f"guest hint missing: {row!r}"
 
     asyncio.run(scenario())
+
+
+def test_library_table_fills_pane(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("YT_TUI_MPV_EXTRA", "--ao=null")
+
+    async def scenario() -> None:
+        app = YTMusicTUI()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.press("escape")
+            await pilot.press("3")
+            await pilot.pause()
+            pane = app.query_one("#library")
+            section_tabs = app.query_one("#lib-tabs")
+            table = app.query_one("#library-table")
+            assert section_tabs.size.height <= 5, f"section tabs grew: {section_tabs.size}"
+            assert table.size.height >= 10, f"library table squeezed off-pane: {table.size}"
+            assert section_tabs.size.height + table.size.height <= pane.size.height + 1
+            await pilot.press("4")
+            await pilot.pause()
+            history = app.query_one("#history-table")
+            assert history.size.height >= 10, f"history table squeezed: {history.size}"
+            await pilot.press("5")
+            await pilot.pause()
+            profile = app.query_one("#profile-table")
+            assert profile.size.height >= 10, f"profile table squeezed: {profile.size}"
+
+    asyncio.run(scenario())

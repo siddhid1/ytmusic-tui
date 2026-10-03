@@ -174,7 +174,7 @@ class YTMusicTUI(App):
         margin-top: 1;
     }
     #lib-tabs {
-        height: auto;
+        height: 2;
     }
     #library-table, #history-table, #profile-table {
         height: 1fr;
